@@ -74,7 +74,24 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
   let db = 10.0 * log2(max(energy, 1e-20)) * 0.30102999566;
   let t = clamp((db - V.b.y) / max(V.b.z - V.b.y, 1e-6), 0.0, 1.0);
 
-  let rgb = textureSampleLevel(palette, paletteSampler, vec2<f32>(t, 0.5), 0.0).rgb;
+  // On paper, print the palette backwards.
+  //
+  // Every palette in the set climbs from near black to something bright, because every one of
+  // them was drawn for a dark screen where loud means luminous. Put that on white and it says
+  // the opposite of what it means: silence arrives as the darkest ink on the page and a loud
+  // partial as the palest. Reversing the lookup keeps each palette's character — its hues, its
+  // order, its monotonic lightness — and lands silence on the paper it is already the colour of.
+  let paper = smoothstep(0.32, 0.62, dot(S.background.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)));
+  let lookup = mix(t, 1.0 - t, paper);
+  let rgb = textureSampleLevel(palette, paletteSampler, vec2<f32>(lookup, 0.5), 0.0).rgb;
   let a = S.geom.y;
-  return vec4<f32>(rgb * a, a);
+  // Emission and coverage part company here, and only here.
+  //
+  // Everything else in this renderer writes `vec4(colour * a, a)`, where the two mean one thing.
+  // A spectrogram is not a mark on a background, it is an image that fills its pane, so its
+  // emission is the palette at full strength — but how much of the *paper* it covers is how much
+  // energy is in the bin, and a bin at the floor covers none of it. Reporting the constant here
+  // told the ink compositing in post.wgsl that the whole pane was solid, which turned a silent
+  // spectrogram on a light theme into a sheet of flat black.
+  return vec4<f32>(rgb * a, a * t);
 }
