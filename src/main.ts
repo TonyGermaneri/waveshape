@@ -347,7 +347,11 @@ async function main(): Promise<void> {
 
     const sampleRate = engineStatus.sampleRate || analyzer.sampleRate || 48000
     const nyquist = sampleRate / 2
-    const { mix, count } = channelMix(config.analysis.channelMode)
+    // Stereo analysis of a mono capture is two identical lanes. Collapse to one so a mono
+    // source draws a single centred trace — and costs half the transforms while it is at it.
+    const requested = channelMix(config.analysis.channelMode)
+    const mix = requested.mix
+    const count = analyzer.ringChannels === 1 ? 1 : requested.count
     const mode = config.mode
     const spectral = mode === 'spectrum' || mode === 'spectrogram'
 

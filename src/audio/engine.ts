@@ -172,7 +172,9 @@ export class AudioEngine {
     } else if (request.kind === 'generator' && request.generator) {
       const { node, description } = this.buildGenerator(ctx, request.generator)
       this.sourceNode = node
-      channels = 2
+      // The generator feeds both channels, but honour the requested count so the mono path
+      // can actually be exercised with a test signal.
+      channels = request.channels
       label = description
     } else {
       throw new Error('no source specified')
