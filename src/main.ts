@@ -8,6 +8,7 @@ import { Analyzer } from './gpu/analyzer.ts'
 import { Renderer } from './gpu/renderer.ts'
 import { buildGraticule } from './ui/axes.ts'
 import { Overlay, type OverlayStatus } from './ui/overlay.ts'
+import { dispatchKey, type KeyActions } from './ui/keymap.ts'
 import { buildWindowTables } from './dsp/windows.ts'
 import type { LoudnessReading } from './dsp/loudness.ts'
 import type { MetersMessage, MetersReport } from './workers/meters-worker.ts'
@@ -262,30 +263,42 @@ async function main(): Promise<void> {
   void engine.listInputs().then((devices) => overlay.setDevices(devices))
 
   // ------------------------------------------------------------------ input
-  window.addEventListener('keydown', (event) => {
-    const target = event.target as HTMLElement | null
-    if (target && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) {
-      if (event.key === 'Escape') target.blur()
-      return
-    }
-    const key = event.key.toLowerCase()
-    if (key === ' ' || key === 'escape' || key === 'h') {
-      event.preventDefault()
-      overlay.toggle()
-      return
-    }
-    const modeIndex = ['1', '2', '3', '4'].indexOf(key)
-    if (modeIndex >= 0) {
-      config.mode = (['wave', 'spectrum', 'spectrogram', 'vector'] as const)[modeIndex]
-      overlay.rebuild()
+  const keyActions: KeyActions = {
+    togglePanel: () => overlay.toggle(),
+    toggleFullscreen: () => void overlay.toggleFullscreen(),
+    toggleHelp: () => overlay.toggleHelp(),
+    cycleTab: (dir) => overlay.cycleTab(dir),
+    cycleTheme: (dir) => overlay.cycleTheme(dir),
+    restartSource: () => void startSource(),
+    stopSource: () => void stopSource(),
+    resetMeters: () => postMeters({ type: 'reset' }),
+    notify: (text) => overlay.notify(text),
+    changed: (structural) => {
       scheduleSave()
-      return
+      // Non-structural changes are picked up by the panel's per-frame refresh; a structural one
+      // can add or remove controls, so the tab has to be rebuilt.
+      if (structural && overlay.isVisible) overlay.rebuild()
+    },
+  }
+
+  window.addEventListener('keydown', (event) => {
+    // The modal reference owns the keyboard while it is up, including Escape, which the dialog
+    // element handles itself.
+    if (overlay.isHelpOpen) return
+
+    const target = event.target as HTMLElement | null
+    if (target) {
+      const tag = target.tagName
+      // A focused field owns its keys — a slider must keep the arrows, a text box its letters.
+      if (/^(INPUT|SELECT|TEXTAREA)$/.test(tag) || target.isContentEditable) {
+        if (event.key === 'Escape') target.blur()
+        return
+      }
+      // Space and Enter activate a focused button; anything else is fair game.
+      if (tag === 'BUTTON' && (event.key === ' ' || event.key === 'Enter')) return
     }
-    if (key === 'f') {
-      void (document.fullscreenElement
-        ? document.exitFullscreen()
-        : document.documentElement.requestFullscreen())
-    }
+
+    if (dispatchKey(event, { config, actions: keyActions })) event.preventDefault()
   })
 
   // ------------------------------------------------------------------ sizing

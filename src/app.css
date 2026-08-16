@@ -1,18 +1,35 @@
 /*
  * The canvas owns the viewport. Everything else floats above it and is dismissable, so the
  * waveform is never cropped to make room for chrome.
+ *
+ * Every colour here is a custom property written by `ui/theme.ts`. The values below are the
+ * defaults the page paints with before the first frame, and the fallback if a theme omits one —
+ * nothing in this file hard-codes a colour that a theme is supposed to own.
  */
 
 :root {
   --ws-panel: rgba(14, 15, 18, 0.82);
   --ws-panel-solid: #0e0f12;
-  --ws-line: rgba(255, 255, 255, 0.1);
-  --ws-line-strong: rgba(255, 255, 255, 0.2);
-  --ws-text: rgba(255, 255, 255, 0.92);
-  --ws-muted: rgba(255, 255, 255, 0.52);
-  --ws-faint: rgba(255, 255, 255, 0.34);
+  --ws-line: rgba(255, 255, 255, 0.11);
+  --ws-line-strong: rgba(255, 255, 255, 0.22);
+  --ws-surface: rgba(255, 255, 255, 0.05);
+  --ws-surface-strong: rgba(255, 255, 255, 0.11);
+  --ws-text: rgba(255, 255, 255, 0.94);
+  --ws-muted: rgba(255, 255, 255, 0.6);
+  --ws-faint: rgba(255, 255, 255, 0.4);
   --ws-accent: #4bb4ff;
+  --ws-accent-soft: rgba(75, 180, 255, 0.18);
+  --ws-accent-line: rgba(75, 180, 255, 0.45);
+  --ws-knob: #eaf4ff;
+  --ws-scrim: rgba(0, 0, 0, 0.62);
+  --ws-shadow: rgba(0, 0, 0, 0.55);
+  --ws-canvas: #000000;
+  --ws-canvas-ink: rgba(255, 255, 255, 0.78);
+  --ws-canvas-ink-soft: rgba(255, 255, 255, 0.5);
+  --ws-canvas-scrim: rgba(0, 0, 0, 0.42);
+  --ws-canvas-shadow: rgba(0, 0, 0, 0.8);
   --ws-radius: 10px;
+  --ws-blur: blur(22px) saturate(140%);
   --ws-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --ws-sans: system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
   color-scheme: dark;
@@ -62,14 +79,14 @@ body {
   font-family: var(--ws-mono);
   font-size: 10px;
   letter-spacing: 0.02em;
-  color: var(--ws-faint);
+  color: var(--ws-canvas-ink-soft);
 }
 
 .ws-tick {
   position: absolute;
   padding: 1px 4px;
   border-radius: 3px;
-  background: rgba(0, 0, 0, 0.34);
+  background: var(--ws-canvas-scrim);
   white-space: nowrap;
   transform: translateY(-50%);
 }
@@ -90,9 +107,9 @@ body {
   gap: 4px 14px;
   font-family: var(--ws-mono);
   font-size: 11px;
-  color: var(--ws-muted);
+  color: var(--ws-canvas-ink);
   pointer-events: none;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  text-shadow: 0 1px 3px var(--ws-canvas-shadow);
 }
 
 .ws-stat {
@@ -101,7 +118,7 @@ body {
 
 .ws-stat em {
   font-style: normal;
-  color: var(--ws-faint);
+  color: var(--ws-canvas-ink-soft);
   margin-right: 5px;
 }
 
@@ -112,13 +129,19 @@ body {
   left: 50%;
   bottom: 44px;
   transform: translate(-50%, 8px);
+  max-width: min(80vw, 620px);
   padding: 7px 14px;
   border-radius: 999px;
-  background: rgba(0, 0, 0, 0.6);
+  background: var(--ws-panel);
+  backdrop-filter: var(--ws-blur);
+  -webkit-backdrop-filter: var(--ws-blur);
   border: 1px solid var(--ws-line);
   font-family: var(--ws-mono);
-  font-size: 11px;
-  color: var(--ws-muted);
+  font-size: 11.5px;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ws-text);
   opacity: 0;
   transition: opacity 0.25s ease, transform 0.25s ease;
   pointer-events: none;
@@ -140,11 +163,11 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--ws-panel);
-  backdrop-filter: blur(22px) saturate(140%);
-  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  backdrop-filter: var(--ws-blur);
+  -webkit-backdrop-filter: var(--ws-blur);
   border: 1px solid var(--ws-line);
   border-radius: var(--ws-radius);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 60px var(--ws-shadow);
   overflow: hidden;
   transition: opacity 0.16s ease, transform 0.16s ease;
 }
@@ -161,11 +184,18 @@ body {
 
 .ws-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px 10px;
+  gap: 10px;
+  padding: 12px 14px 10px;
   border-bottom: 1px solid var(--ws-line);
+}
+
+.ws-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
 }
 
 .ws-title strong {
@@ -191,11 +221,13 @@ body {
   padding: 4px 9px;
   border-radius: 6px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .ws-close:hover {
   color: var(--ws-text);
   border-color: var(--ws-line-strong);
+  background: var(--ws-surface);
 }
 
 .ws-modes {
@@ -208,7 +240,7 @@ body {
 .ws-mode {
   appearance: none;
   border: 1px solid transparent;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--ws-surface);
   color: var(--ws-muted);
   border-radius: 7px;
   padding: 8px 4px 7px;
@@ -235,22 +267,22 @@ body {
 }
 
 .ws-mode.ws-active {
-  background: rgba(75, 180, 255, 0.16);
-  border-color: rgba(75, 180, 255, 0.4);
-  color: #dcefff;
+  background: var(--ws-accent-soft);
+  border-color: var(--ws-accent-line);
+  color: var(--ws-text);
 }
 
+/*
+ * The tabs wrap rather than scroll. A horizontal scroller hides the tabs that do not fit behind
+ * an edge with no affordance, and there are enough of them now that the last one would never be
+ * found.
+ */
 .ws-tabs {
   display: flex;
-  gap: 2px;
+  flex-wrap: wrap;
+  gap: 0 2px;
   padding: 0 12px;
-  overflow-x: auto;
-  scrollbar-width: none;
   border-bottom: 1px solid var(--ws-line);
-}
-
-.ws-tabs::-webkit-scrollbar {
-  display: none;
 }
 
 .ws-tab {
@@ -260,7 +292,7 @@ body {
   color: var(--ws-faint);
   font-family: inherit;
   font-size: 11.5px;
-  padding: 9px 8px;
+  padding: 8px 7px;
   cursor: pointer;
   white-space: nowrap;
   border-bottom: 2px solid transparent;
@@ -287,7 +319,7 @@ body {
 }
 
 .ws-body::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--ws-line-strong);
   border-radius: 999px;
   border: 3px solid transparent;
   background-clip: content-box;
@@ -340,6 +372,25 @@ body {
   color: var(--ws-text);
 }
 
+.ws-label-keys {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: 7px;
+  vertical-align: baseline;
+}
+
+.ws-label-keys kbd {
+  font-family: var(--ws-mono);
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--ws-faint);
+  border: 1px solid var(--ws-line);
+  border-radius: 3px;
+  padding: 0 3px;
+  min-width: 13px;
+  text-align: center;
+}
+
 .ws-value {
   font-family: var(--ws-mono);
   font-size: 10.5px;
@@ -363,11 +414,15 @@ body {
   margin: 0 0 14px;
   padding: 9px 11px;
   border-left: 2px solid var(--ws-line-strong);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--ws-surface);
   border-radius: 0 6px 6px 0;
   font-size: 10.5px;
   line-height: 1.5;
   color: var(--ws-muted);
+}
+
+.ws-note-warn {
+  border-left-color: var(--ws-accent);
 }
 
 .ws-row {
@@ -384,7 +439,7 @@ body {
 .ws-select {
   width: 100%;
   appearance: none;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--ws-surface);
   border: 1px solid var(--ws-line);
   border-radius: 6px;
   color: var(--ws-text);
@@ -398,13 +453,43 @@ body {
 .ws-select:focus-visible,
 .ws-slider:focus-visible,
 .ws-button:focus-visible,
-.ws-check:focus-visible {
+.ws-check:focus-visible,
+.ws-input:focus-visible,
+.ws-swatch:focus-visible,
+.ws-close:focus-visible {
   outline: 2px solid var(--ws-accent);
   outline-offset: 2px;
 }
 
 .ws-select option {
   background: var(--ws-panel-solid);
+}
+
+.ws-input {
+  width: 100%;
+  appearance: none;
+  background: var(--ws-surface);
+  border: 1px solid var(--ws-line);
+  border-radius: 6px;
+  color: var(--ws-text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 7px 9px;
+  margin-top: 5px;
+}
+
+.ws-input::placeholder {
+  color: var(--ws-faint);
+}
+
+.ws-textarea {
+  font-family: var(--ws-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  resize: vertical;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
 }
 
 .ws-slider {
@@ -418,13 +503,13 @@ body {
 .ws-slider::-webkit-slider-runnable-track {
   height: 3px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--ws-line-strong);
 }
 
 .ws-slider::-moz-range-track {
   height: 3px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--ws-line-strong);
 }
 
 .ws-slider::-webkit-slider-thumb {
@@ -433,7 +518,7 @@ body {
   height: 13px;
   margin-top: -5px;
   border-radius: 50%;
-  background: #eaf4ff;
+  background: var(--ws-knob);
   border: 1px solid rgba(0, 0, 0, 0.4);
 }
 
@@ -441,7 +526,7 @@ body {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: #eaf4ff;
+  background: var(--ws-knob);
   border: 1px solid rgba(0, 0, 0, 0.4);
 }
 
@@ -455,7 +540,7 @@ body {
   width: 30px;
   height: 17px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--ws-surface-strong);
   border: 1px solid var(--ws-line);
   position: relative;
   cursor: pointer;
@@ -471,18 +556,23 @@ body {
   width: 11px;
   height: 11px;
   border-radius: 50%;
-  background: #d9dee6;
+  background: var(--ws-knob);
   transition: transform 0.14s ease;
 }
 
 .ws-check:checked {
-  background: rgba(75, 180, 255, 0.55);
-  border-color: rgba(75, 180, 255, 0.7);
+  background: var(--ws-accent-soft);
+  border-color: var(--ws-accent-line);
 }
 
 .ws-check:checked::after {
   transform: translateX(13px);
-  background: #fff;
+  background: var(--ws-accent);
+}
+
+.ws-check:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .ws-color {
@@ -510,7 +600,7 @@ body {
   width: 100%;
   appearance: none;
   border: 1px solid var(--ws-line);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--ws-surface);
   color: var(--ws-text);
   border-radius: 6px;
   font-family: inherit;
@@ -520,8 +610,249 @@ body {
 }
 
 .ws-button:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--ws-surface-strong);
   border-color: var(--ws-line-strong);
+}
+
+.ws-button-accent {
+  background: var(--ws-accent-soft);
+  border-color: var(--ws-accent-line);
+}
+
+.ws-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ws-button:disabled:hover {
+  background: var(--ws-surface);
+  border-color: var(--ws-line);
+}
+
+/* ---------------------------------------------------------------- theme swatches */
+
+.ws-swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ws-swatch {
+  appearance: none;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid var(--ws-line);
+  border-radius: 7px;
+  background: var(--ws-surface);
+  color: var(--ws-muted);
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ws-swatch:hover {
+  color: var(--ws-text);
+  border-color: var(--ws-line-strong);
+}
+
+.ws-swatch.ws-active {
+  border-color: var(--ws-accent-line);
+  background: var(--ws-accent-soft);
+  color: var(--ws-text);
+}
+
+.ws-swatch-chip {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  height: 30px;
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid var(--ws-line);
+  overflow: hidden;
+}
+
+.ws-swatch-bar {
+  display: block;
+  height: 2px;
+  border-radius: 999px;
+}
+
+.ws-swatch-bar:nth-child(1) {
+  width: 100%;
+}
+
+.ws-swatch-bar:nth-child(2) {
+  width: 62%;
+}
+
+.ws-swatch-bar:nth-child(3) {
+  width: 38%;
+}
+
+.ws-swatch-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ws-swatch-tag {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  font-family: var(--ws-mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ws-faint);
+  /* Opaque, because it sits over the theme's own colours rather than over the panel. */
+  background: var(--ws-panel-solid);
+  border: 1px solid var(--ws-line);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+/* ---------------------------------------------------------------- keyboard reference */
+
+.ws-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(80vh, 760px);
+  padding: 0;
+  border: 1px solid var(--ws-line);
+  border-radius: var(--ws-radius);
+  background: var(--ws-panel);
+  backdrop-filter: var(--ws-blur);
+  -webkit-backdrop-filter: var(--ws-blur);
+  box-shadow: 0 30px 80px var(--ws-shadow);
+  color: var(--ws-text);
+  font-family: var(--ws-sans);
+  overflow: hidden;
+}
+
+.ws-dialog::backdrop {
+  background: var(--ws-scrim);
+  backdrop-filter: blur(2px);
+}
+
+.ws-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.ws-dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--ws-line);
+}
+
+.ws-dialog-head .ws-title {
+  flex: none;
+}
+
+.ws-dialog-filter {
+  margin-top: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ws-dialog-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 16px 12px;
+  columns: 2;
+  column-gap: 26px;
+}
+
+.ws-dialog-body::-webkit-scrollbar {
+  width: 9px;
+}
+
+.ws-dialog-body::-webkit-scrollbar-thumb {
+  background: var(--ws-line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.ws-keygroup {
+  break-inside: avoid;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.ws-keyrow {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 0;
+  break-inside: avoid;
+}
+
+.ws-keyrow-dim {
+  opacity: 0.42;
+}
+
+.ws-keys {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  width: 82px;
+  justify-content: flex-end;
+}
+
+.ws-keys kbd {
+  font-family: var(--ws-mono);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--ws-text);
+  background: var(--ws-surface-strong);
+  border: 1px solid var(--ws-line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 4px;
+  min-width: 17px;
+  text-align: center;
+}
+
+.ws-keytext {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-keylabel {
+  font-size: 11.5px;
+  color: var(--ws-text);
+}
+
+.ws-keyscope {
+  display: inline-block;
+  margin-left: 6px;
+  font-family: var(--ws-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--ws-faint);
+  border: 1px solid var(--ws-line);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.ws-dialog-foot {
+  margin: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--ws-line);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ws-faint);
 }
 
 /* ---------------------------------------------------------------- blocking states */
@@ -571,6 +902,10 @@ body {
 
   .ws-readout {
     display: none;
+  }
+
+  .ws-dialog-body {
+    columns: 1;
   }
 }
 

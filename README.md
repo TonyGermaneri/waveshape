@@ -24,7 +24,67 @@ Four modes, one capture and transform core, switchable with `1`–`4`:
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
 | **Vectorscope** | Mid/side goniometer with phase correlation. |
 
-Press `space`, `esc` or `h` to toggle the overlay; `f` for full screen.
+Press `space`, `esc` or `h` to toggle the overlay, `f` for full screen, `?` for the keyboard
+reference.
+
+---
+
+## Controls
+
+The scheme is **arrows shape the picture, letters drive the machine**. Arrow keys are
+contextual — gain and time span in the oscilloscope, level window and frequency range in the
+spectrum and spectrogram — while the letter and punctuation pairs adjust the transform and the
+look identically in every mode. Every pair is physically adjacent, left decreasing and right
+increasing.
+
+| | |
+| --- | --- |
+| `space` `esc` `h` | Show or hide the control panel |
+| `f` | Full screen |
+| `?` `F1` | Keyboard reference |
+| `` ` `` `~` | Next / previous panel tab |
+| `1` `2` `3` `4` | Waveform · Spectrum · Spectrogram · Vectorscope |
+| `-` `=` | FFT size |
+| `[` `]` | Hop size |
+| `q` `w` | Window function |
+| `a` `s` | Averaging |
+| `c` `e` `m` | Channels analysed · reassignment · magnitude scale |
+| `↑` `↓` | Vertical gain, or the level window in the spectral modes |
+| `←` `→` | Time span, or the frequency range |
+| `⇧←` `⇧→` | Zoom the frequency range (clarity threshold in the oscilloscope) |
+| `⇧↑` `⇧↓` | Dynamic range (trigger level in the oscilloscope) |
+| `d` `j` `k` `v` `o` `p` | Per-mode display switches — see the reference |
+| `t` `⇧T` | Next / previous theme |
+| `z` `x` · `.` `/` · `;` `'` · `<` `>` · `9` `0` | Persistence · exposure · bloom · intensity · line width |
+| `b` `g` `l` `y` | Tone curve · graticule · axis labels · readout bar |
+| `r` `⇧R` `n` `u` `i` | Restart · stop · reset loudness · monitor gain |
+
+The reference dialog, the dispatcher and the key caps printed beside each control are all
+generated from one table in `ui/keymap.ts`, so a binding cannot exist without being documented.
+Bindings that belong to another mode are shown dimmed rather than hidden, because "why does `↑`
+do something different here" is the question the dialog exists to answer. Shortcuts are ignored
+while a control has focus, so a slider still takes the arrow keys.
+
+---
+
+## Themes
+
+Eighteen built in, from **Studio** through **Phosphor CRT**, **Blueprint**, **Matrix** and
+**Vaporwave** to **Paper** and **Solarized**. A theme is a complete look rather than a colour
+pair: the four canvas colours, the whole post chain (persistence, bloom, tone curve, exposure,
+gamma, saturation, vignette), the graticule, the spectrogram colour map, **and the overlay's own
+chrome** — panel colour, opacity, text, accent, radius and backdrop blur. The panel restyles
+itself along with the trace and switches to a light colour scheme when its background is light,
+so a light theme does not leave a dark control surface floating over a white waveform.
+
+The tick labels and the readout bar take their ink from the *scene* background rather than the
+panel, because they sit on the canvas: a light canvas under a dark panel is a reasonable theme,
+and white labels on white paper are not.
+
+**Theme ▸ Save current look** captures everything above under a name and keeps it in
+localStorage under its own key, so resetting the settings profile on the System tab leaves the
+saved themes alone. Saving over a name replaces it. Themes also round-trip as JSON through the
+transfer box for moving one between machines.
 
 ---
 
@@ -146,10 +206,16 @@ rainbow puts a bright band in the middle of a smooth ramp and you read it as a p
 Two independent layers, because a GPU FFT can be subtly wrong — a flipped sign in a butterfly, a
 twiddle indexed off by a stride — and still produce a plausible-looking spectrum.
 
-`npm test` runs 16 checks against `dsp/`, including the packed real FFT versus a naive DFT at
-every shipped size, Parseval, exact window sums, K-weighting against the coefficients tabulated
-in BS.1770-4, NSDF octave robustness on a harmonic stack, and reassignment placing an impulse on
-its exact sample and an off-bin sinusoid within 0.01 Hz.
+`npm test` runs 22 checks. Sixteen are numerical, against `dsp/`: the packed real FFT versus a
+naive DFT at every shipped size, Parseval, exact window sums, K-weighting against the
+coefficients tabulated in BS.1770-4, NSDF octave robustness on a harmonic stack, and
+reassignment placing an impulse on its exact sample and an off-bin sinusoid within 0.01 Hz.
+
+The other six cover the keyboard map, which is the one part of the UI that fails silently — a
+duplicate token does not throw, it just makes the second binding unreachable in whichever mode
+shadows it. They enumerate every reachable mode and trigger combination and assert that no two
+bindings answer to the same keystroke, that tokens are canonical, and that driving every numeric
+binding two hundred steps into its rail leaves the config finite and its ranges non-inverted.
 
 The **System ▸ Run FFT self-test** button pushes a synthetic two-tone signal through the real
 GPU pipeline and compares the result against the f64 CPU reference. Measured on this machine:
@@ -218,7 +284,7 @@ src/
   dsp/      windows, reference FFT, biquads, BS.1770-4 loudness, tests
   gpu/      device init, compute orchestration, render passes
     shaders/  WGSL: prepare, fft, unpack, analyze, envelope, nsdf, speccols, draw_*, post
-  ui/       tabbed overlay, controls, graticule
+  ui/       tabbed overlay, controls, keyboard map and reference, themes, graticule
   workers/  loudness metering
 ```
 

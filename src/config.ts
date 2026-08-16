@@ -15,8 +15,27 @@ export type TriggerMode = 'free' | 'level' | 'pitch'
 
 export type TraceMode = 'auto' | 'envelope' | 'bandlimited'
 
+/**
+ * Chrome colours. The overlay derives every one of its CSS custom properties from these five
+ * values, so a theme restyles the panel as well as the canvas rather than leaving a dark
+ * control surface floating over a light trace.
+ */
+export interface UiTheme {
+  /** Panel base colour, before the opacity below is applied. */
+  panel: string
+  opacity: number
+  /** Text colour; the muted, faint and border tones are alpha ramps of it. */
+  text: string
+  accent: string
+  radius: number
+  /** Backdrop blur behind the panel, in pixels. 0 disables it. */
+  blur: number
+}
+
 export interface Config {
   mode: Mode
+  /** Id of the theme last applied. Only used to show which entry is current. */
+  themeId: string
   source: {
     kind: SourceKind
     deviceId: string
@@ -115,6 +134,7 @@ export interface Config {
     showLabels: boolean
     showReadout: boolean
   }
+  ui: UiTheme
   perf: {
     /** Analysis frames processed per rendered frame before older ones are dropped. */
     maxFramesPerRender: number
@@ -139,6 +159,7 @@ export const SAMPLE_RATES = [
 
 export const DEFAULT_CONFIG: Config = {
   mode: 'wave',
+  themeId: 'studio',
   source: {
     kind: 'microphone',
     deviceId: '',
@@ -229,6 +250,14 @@ export const DEFAULT_CONFIG: Config = {
     showLabels: true,
     showReadout: true,
   },
+  ui: {
+    panel: '#0e0f12',
+    opacity: 0.82,
+    text: '#ffffff',
+    accent: '#4bb4ff',
+    radius: 10,
+    blur: 22,
+  },
   perf: {
     maxFramesPerRender: 24,
     resolutionScale: 1,
@@ -236,89 +265,6 @@ export const DEFAULT_CONFIG: Config = {
     showStats: false,
   },
 }
-
-export interface StylePreset {
-  id: string
-  label: string
-  style: Partial<Config['style']>
-}
-
-export const STYLE_PRESETS: readonly StylePreset[] = [
-  {
-    id: 'studio',
-    label: 'Studio',
-    style: {
-      background: '#000000',
-      primary: '#ffffff',
-      secondary: '#8a8a8a',
-      accent: '#40b8ff',
-      persistence: 0,
-      bloom: 0.25,
-      tonemap: 'reinhard',
-      vignette: 0,
-    },
-  },
-  {
-    id: 'phosphor',
-    label: 'Phosphor CRT',
-    style: {
-      background: '#00120a',
-      primary: '#7dff9b',
-      secondary: '#1d6b3a',
-      accent: '#b8ffcb',
-      persistence: 0.82,
-      bloom: 0.6,
-      bloomThreshold: 0.4,
-      tonemap: 'reinhard',
-      vignette: 0.35,
-    },
-  },
-  {
-    id: 'amber',
-    label: 'Amber',
-    style: {
-      background: '#120800',
-      primary: '#ffb247',
-      secondary: '#7a4b12',
-      accent: '#ffe0a8',
-      persistence: 0.75,
-      bloom: 0.5,
-      bloomThreshold: 0.45,
-      tonemap: 'aces',
-      vignette: 0.3,
-    },
-  },
-  {
-    id: 'ice',
-    label: 'Ice',
-    style: {
-      background: '#01060e',
-      primary: '#9fe8ff',
-      secondary: '#1d5878',
-      accent: '#ffffff',
-      persistence: 0.4,
-      bloom: 0.45,
-      tonemap: 'aces',
-      vignette: 0.15,
-    },
-  },
-  {
-    id: 'paper',
-    label: 'Paper (light)',
-    style: {
-      background: '#f4f2ee',
-      primary: '#101014',
-      secondary: '#8d8a84',
-      accent: '#b03a2e',
-      persistence: 0,
-      bloom: 0,
-      exposure: 1,
-      tonemap: 'clip',
-      gridAlpha: 0.4,
-      vignette: 0,
-    },
-  },
-]
 
 const STORAGE_KEY = 'waveshape.config.v1'
 

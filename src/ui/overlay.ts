@@ -8,21 +8,30 @@
  * and is reachable by assistive technology.
  */
 
-import {
-  DEFAULT_CONFIG,
-  FFT_SIZES,
-  SAMPLE_RATES,
-  STYLE_PRESETS,
-  type Config,
-  type Mode,
-} from '../config.ts'
+import { DEFAULT_CONFIG, FFT_SIZES, SAMPLE_RATES, type Config, type Mode } from '../config.ts'
 import { WINDOWS, windowSpec } from '../dsp/windows.ts'
 import { PALETTES } from '../gpu/colormap.ts'
 import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
 import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
-import { fmt, renderControls, type Control } from './widgets.ts'
+import { fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
+import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
+import { KeyHelp } from './help.ts'
+import { BINDINGS, keyLabel } from './keymap.ts'
+import {
+  allThemes,
+  applyTheme,
+  applyUiTheme,
+  findTheme,
+  loadUserThemes,
+  saveUserThemes,
+  themeFromConfig,
+  themeMatchesConfig,
+  themeToJson,
+  themesFromJson,
+  type Theme,
+} from './theme.ts'
 
 const MODES: { id: Mode; label: string; key: string }[] = [
   { id: 'wave', label: 'Waveform', key: '1' },
@@ -38,6 +47,7 @@ const TABS = [
   'Spectrum',
   'Spectrogram',
   'Meters',
+  'Theme',
   'Appearance',
   'System',
 ] as const
@@ -82,16 +92,29 @@ export class Overlay {
   private readonly labelLayer: HTMLElement
   private readonly toast: HTMLElement
 
+  private readonly help: KeyHelp
+  private readonly fullscreenButton: HTMLButtonElement
+
   private tab: Tab = 'Source'
   private refreshControls: () => void = () => {}
   private devices: AudioDeviceInfo[] = []
   private visible = true
   private selfTestResult = ''
   private labelPool: HTMLElement[] = []
+  private toastTimer = 0
+
+  private uiSignature = ''
+  private userThemes: Theme[] = []
+  /** Draft name for the next "save theme", kept out of the config: it is not a setting. */
+  private themeName = ''
+  private themeTransfer = ''
+  private themeMessage = ''
 
   constructor(root: HTMLElement, deps: OverlayDeps) {
     this.root = root
     this.deps = deps
+    this.userThemes = loadUserThemes()
+    this.help = new KeyHelp(deps.config)
 
     this.labelLayer = document.createElement('div')
     this.labelLayer.className = 'ws-labels'
@@ -115,12 +138,25 @@ export class Overlay {
     const title = document.createElement('div')
     title.className = 'ws-title'
     title.innerHTML = '<strong>Waveshape</strong><span>WebGPU spectral analyzer</span>'
-    const hide = document.createElement('button')
-    hide.type = 'button'
-    hide.className = 'ws-close'
-    hide.textContent = 'Hide  ·  esc'
-    hide.addEventListener('click', () => this.setVisible(false))
-    header.append(title, hide)
+
+    const actions = document.createElement('div')
+    actions.className = 'ws-header-actions'
+    const chip = (text: string, tooltip: string, onClick: () => void) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'ws-close'
+      button.textContent = text
+      button.title = tooltip
+      button.addEventListener('click', onClick)
+      return button
+    }
+    this.fullscreenButton = chip('⤢  f', 'Full screen (f)', () => void this.toggleFullscreen())
+    actions.append(
+      chip('⌨  ?', 'Keyboard reference (?)', () => this.toggleHelp()),
+      this.fullscreenButton,
+      chip('Hide  ·  esc', 'Hide the control panel (esc)', () => this.setVisible(false)),
+    )
+    header.append(title, actions)
 
     this.panel.append(header, this.modeBar, this.tabBar, this.body)
 
@@ -129,9 +165,15 @@ export class Overlay {
 
     this.toast = document.createElement('div')
     this.toast.className = 'ws-toast'
-    this.toast.textContent = 'press space, esc or h for controls'
 
     this.root.append(this.labelLayer, this.panel, this.readout, this.toast)
+
+    this.syncChrome()
+    onFullscreenChange(() => {
+      this.syncFullscreenButton()
+      if (this.tab === 'System') this.refreshControls()
+    })
+    this.syncFullscreenButton()
 
     this.buildModeBar()
     this.buildTabBar()
@@ -142,17 +184,99 @@ export class Overlay {
     return this.visible
   }
 
+  get isHelpOpen(): boolean {
+    return this.help.isOpen
+  }
+
   setVisible(visible: boolean): void {
     this.visible = visible
     this.panel.classList.toggle('ws-hidden', !visible)
-    if (!visible) {
-      this.toast.classList.add('ws-toast-show')
-      window.setTimeout(() => this.toast.classList.remove('ws-toast-show'), 1600)
-    }
+    // Anything could have moved while the panel was away — a shortcut, a preset, a theme — so
+    // it comes back showing the truth rather than whatever it was displaying when it left.
+    if (visible) this.rebuild()
+    else this.notify('space · esc · h  for controls        ?  for keys')
   }
 
   toggle(): void {
     this.setVisible(!this.visible)
+  }
+
+  /** Flashes a line over the canvas. The only feedback a shortcut gets when the panel is hidden. */
+  notify(text: string, ms = 1500): void {
+    this.toast.textContent = text
+    this.toast.classList.add('ws-toast-show')
+    window.clearTimeout(this.toastTimer)
+    this.toastTimer = window.setTimeout(() => this.toast.classList.remove('ws-toast-show'), ms)
+  }
+
+  toggleHelp(): void {
+    this.help.toggle()
+  }
+
+  async toggleFullscreen(): Promise<void> {
+    const wanted = !isFullscreen()
+    if (wanted && !fullscreenSupported()) {
+      this.notify('Full screen is not available in this browser')
+      return
+    }
+    const on = await toggleFullscreen()
+    this.syncFullscreenButton()
+    if (wanted && !on) {
+      // Refused: no user activation, or a permissions policy that forbids it. Saying "off"
+      // here would read as if the toggle had worked in the other direction.
+      this.notify('The browser refused full screen')
+      return
+    }
+    this.notify(on ? 'Full screen  ·  press f or esc to leave' : 'Full screen off')
+  }
+
+  /** Moves along the tab bar; returns the tab landed on so a shortcut can announce it. */
+  cycleTab(dir: number): string {
+    const index = TABS.indexOf(this.tab)
+    this.tab = TABS[(index + dir + TABS.length) % TABS.length]
+    this.syncTabBar()
+    // Reaching for a tab is a request to see it, so the panel comes back if it was dismissed.
+    if (this.visible) this.rebuild()
+    else this.setVisible(true)
+    return this.tab
+  }
+
+  /** Steps through the built-in and saved themes; returns the label of the one applied. */
+  cycleTheme(dir: number): string {
+    const themes = allThemes(this.userThemes)
+    const index = themes.findIndex((t) => t.id === this.deps.config.themeId)
+    const next = themes[(index + dir + themes.length * 2) % themes.length]
+    this.applyThemeById(next.id)
+    return `Theme  ${next.label}`
+  }
+
+  private applyThemeById(id: string): void {
+    const theme = findTheme(allThemes(this.userThemes), id)
+    if (!theme) return
+    applyTheme(this.deps.config, theme)
+    this.syncChrome()
+    this.deps.onChange()
+    this.rebuild()
+  }
+
+  /**
+   * Pushes the chrome colours into CSS only when they actually changed. A custom property
+   * written on the root element invalidates style for the whole document, which is not
+   * something to do sixty times a second while an unrelated slider is being dragged.
+   */
+  private syncChrome(): void {
+    const config = this.deps.config
+    const signature = `${JSON.stringify(config.ui)}|${config.style.background}`
+    if (signature === this.uiSignature) return
+    this.uiSignature = signature
+    applyUiTheme(config.ui, config.style)
+  }
+
+  private syncFullscreenButton(): void {
+    const on = isFullscreen()
+    this.fullscreenButton.textContent = on ? '⤡  f' : '⤢  f'
+    this.fullscreenButton.title = on ? 'Leave full screen (f)' : 'Full screen (f)'
+    this.fullscreenButton.setAttribute('aria-pressed', String(on))
   }
 
   setDevices(devices: AudioDeviceInfo[]): void {
@@ -223,6 +347,7 @@ export class Overlay {
     this.syncModeBar()
     const scroll = this.body.scrollTop
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
+      this.syncChrome()
       this.deps.onChange()
       this.syncModeBar()
       if (structural) {
@@ -319,6 +444,18 @@ export class Overlay {
   // Tab contents
   // -------------------------------------------------------------------------------------
 
+  /**
+   * Key caps for the binding with this label, so the panel advertises the shortcut next to the
+   * control it drives. A label that no longer matches a binding simply prints nothing, which is
+   * the failure mode you want: a missing hint rather than a wrong one.
+   */
+  private keysFor(label: string, mode?: Mode): string[] | undefined {
+    const binding = BINDINGS.find(
+      (b) => b.label === label && (!mode || !b.modes || b.modes.includes(mode)),
+    )
+    return binding?.keys.filter((k) => !k.alias).map((k) => keyLabel(k.token))
+  }
+
   private controlsFor(tab: Tab): Control[] {
     const c = this.deps.config
     switch (tab) {
@@ -334,6 +471,8 @@ export class Overlay {
         return this.spectrogramControls(c)
       case 'Meters':
         return this.meterControls(c)
+      case 'Theme':
+        return this.themeControls(c)
       case 'Appearance':
         return this.appearanceControls(c)
       case 'System':
@@ -530,6 +669,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Monitor to output',
+        keys: this.keysFor('Monitor to output'),
         min: 0,
         max: 1,
         step: 0.01,
@@ -553,6 +693,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'FFT size',
+        keys: this.keysFor('FFT size'),
         options: FFT_SIZES.map((n) => ({ value: String(n), label: String(n) })),
         get: () => String(a.fftSize),
         set: (v) => {
@@ -563,6 +704,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Window',
+        keys: this.keysFor('Window'),
         options: WINDOWS.map((w) => ({ value: w.id, label: w.label })),
         get: () => a.window,
         set: (v) => {
@@ -589,6 +731,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Hop size',
+        keys: this.keysFor('Hop size'),
         min: 32,
         max: 8192,
         step: 1,
@@ -603,6 +746,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Channels analysed',
+        keys: this.keysFor('Channels analysed'),
         options: [
           { value: 'stereo', label: 'Stereo (L and R)' },
           { value: 'left', label: 'Left only' },
@@ -619,6 +763,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Magnitude scale',
+        keys: this.keysFor('Magnitude scale'),
         options: [
           { value: 'amplitude', label: 'Amplitude (dBFS peak)' },
           { value: 'density', label: 'Power spectral density (dBFS/√Hz)' },
@@ -633,6 +778,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Time-frequency reassignment',
+        keys: this.keysFor('Reassignment'),
         get: () => a.reassign,
         set: (v) => {
           a.reassign = v
@@ -670,6 +816,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Averaging',
+        keys: this.keysFor('Averaging'),
         min: 0,
         max: 5,
         step: 0.05,
@@ -714,6 +861,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Time span',
+        keys: this.keysFor('Time span', 'wave'),
         min: 0.05,
         max: 5000,
         step: 0.01,
@@ -729,6 +877,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Trigger',
+        keys: this.keysFor('Trigger', 'wave'),
         options: [
           { value: 'pitch', label: 'Pitch-locked (NSDF)' },
           { value: 'level', label: 'Level' },
@@ -743,6 +892,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Cycles shown',
+        keys: this.keysFor('Cycles shown', 'wave'),
         min: 0.25,
         max: 32,
         step: 0.25,
@@ -756,6 +906,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Clarity threshold',
+        keys: this.keysFor('Clarity threshold', 'wave'),
         min: 0,
         max: 1,
         step: 0.01,
@@ -803,6 +954,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Trigger level',
+        keys: this.keysFor('Trigger level', 'wave'),
         min: -1,
         max: 1,
         step: 0.001,
@@ -830,6 +982,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Reconstruction',
+        keys: this.keysFor('Reconstruction', 'wave'),
         options: [
           { value: 'auto', label: 'Automatic' },
           { value: 'envelope', label: 'Min/max envelope' },
@@ -844,6 +997,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Vertical gain',
+        keys: this.keysFor('Vertical gain', 'wave'),
         min: 0.05,
         max: 64,
         step: 0.01,
@@ -857,6 +1011,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Show RMS band',
+        keys: this.keysFor('RMS band', 'wave'),
         get: () => w.showRms,
         set: (v) => {
           w.showRms = v
@@ -865,6 +1020,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Split channels into lanes',
+        keys: this.keysFor('Split channels into lanes', 'wave'),
         get: () => w.splitChannels,
         set: (v) => {
           w.splitChannels = v
@@ -880,6 +1036,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Logarithmic frequency',
+        keys: this.keysFor('Logarithmic frequency axis', 'spectrum'),
         get: () => s.logFrequency,
         set: (v) => {
           s.logFrequency = v
@@ -950,6 +1107,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Curve source',
+        keys: this.keysFor('Curve source', 'spectrum'),
         options: [
           { value: 'live', label: 'Instantaneous' },
           { value: 'average', label: 'Averaged' },
@@ -963,6 +1121,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Peak hold trace',
+        keys: this.keysFor('Peak hold trace', 'spectrum'),
         get: () => s.showPeak,
         set: (v) => {
           s.showPeak = v
@@ -971,6 +1130,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Fill opacity',
+        keys: this.keysFor('Fill opacity', 'spectrum'),
         min: 0,
         max: 1,
         step: 0.01,
@@ -983,6 +1143,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Split channels into lanes',
+        keys: this.keysFor('Split channels into lanes', 'spectrum'),
         get: () => s.splitChannels,
         set: (v) => {
           s.splitChannels = v
@@ -1002,6 +1163,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Time span',
+        keys: this.keysFor('History span', 'spectrogram'),
         min: 1,
         max: 120,
         step: 0.5,
@@ -1017,6 +1179,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Logarithmic frequency',
+        keys: this.keysFor('Logarithmic frequency axis', 'spectrogram'),
         get: () => s.logFrequency,
         set: (v) => {
           s.logFrequency = v
@@ -1099,6 +1262,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Splat radius',
+        keys: this.keysFor('Splat radius', 'spectrogram'),
         min: 0.5,
         max: 4,
         step: 0.05,
@@ -1112,6 +1276,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Normalise by coverage',
+        keys: this.keysFor('Normalise by coverage', 'spectrogram'),
         get: () => s.normalise,
         set: (v) => {
           s.normalise = v
@@ -1121,6 +1286,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Palette',
+        keys: this.keysFor('Colour map', 'spectrogram'),
         options: PALETTES.map((p) => ({ value: p.id, label: p.label })),
         get: () => s.palette,
         set: (v) => {
@@ -1200,18 +1366,237 @@ export class Overlay {
     ]
   }
 
+  // -------------------------------------------------------------------------------------
+  // Themes
+  // -------------------------------------------------------------------------------------
+
+  private saveCurrentTheme(): void {
+    const label = this.themeName.trim()
+    if (!label) {
+      this.themeMessage = 'Give the theme a name first.'
+      return
+    }
+    const theme = themeFromConfig(this.deps.config, label)
+    const index = this.userThemes.findIndex((t) => t.id === theme.id)
+    if (index >= 0) this.userThemes[index] = theme
+    else this.userThemes.push(theme)
+    saveUserThemes(this.userThemes)
+    this.deps.config.themeId = theme.id
+    this.themeName = ''
+    this.themeMessage = `Saved “${label}”.`
+    this.notify(`Theme saved  ${label}`)
+  }
+
+  private deleteTheme(id: string): void {
+    const theme = findTheme(this.userThemes, id)
+    if (!theme) return
+    this.userThemes = this.userThemes.filter((t) => t.id !== id)
+    saveUserThemes(this.userThemes)
+    this.themeMessage = `Deleted “${theme.label}”.`
+    // Leave the colours alone — deleting the recipe should not repaint the screen.
+    this.deps.config.themeId = ''
+  }
+
+  private importThemes(): void {
+    try {
+      const imported = themesFromJson(this.themeTransfer)
+      for (const theme of imported) {
+        const index = this.userThemes.findIndex((t) => t.id === theme.id)
+        if (index >= 0) this.userThemes[index] = theme
+        else this.userThemes.push(theme)
+      }
+      saveUserThemes(this.userThemes)
+      const last = imported[imported.length - 1]
+      applyTheme(this.deps.config, last)
+      this.syncChrome()
+      this.themeMessage =
+        imported.length === 1
+          ? `Imported and applied “${last.label}”.`
+          : `Imported ${imported.length} themes, applied “${last.label}”.`
+      this.notify(`Theme  ${last.label}`)
+    } catch (error) {
+      this.themeMessage = `Could not import: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
+  /** Live description of what is on screen, which is not always a theme you can name. */
+  private currentThemeSummary(): string {
+    const current = findTheme(allThemes(this.userThemes), this.deps.config.themeId)
+    if (!current) return 'Custom — not saved'
+    return themeMatchesConfig(this.deps.config, current) ? current.label : `${current.label} — modified`
+  }
+
+  private themeControls(c: Config): Control[] {
+    const themes = allThemes(this.userThemes)
+    const current = findTheme(themes, c.themeId)
+    const options: SwatchOption[] = themes.map((theme) => ({
+      value: theme.id,
+      label: theme.label,
+      colors: [theme.style.background, theme.style.primary, theme.style.accent, theme.style.secondary],
+      tag: theme.builtin ? undefined : 'saved',
+    }))
+    const selectedIsUser = () => {
+      const selected = findTheme(allThemes(this.userThemes), c.themeId)
+      return Boolean(selected && !selected.builtin)
+    }
+
+    return [
+      { kind: 'heading', text: 'Theme' },
+      { kind: 'readout', label: 'Current', get: () => this.currentThemeSummary() },
+      {
+        kind: 'swatches',
+        label: 'Built in and saved',
+        options,
+        get: () => c.themeId,
+        set: (id) => this.applyThemeById(id),
+        hint: 'A theme carries the canvas colours, the whole post chain, the graticule, the spectrogram colour map and the panel’s own chrome. t and ⇧T step through them without opening this tab.',
+      },
+      { kind: 'heading', text: 'Save' },
+      {
+        kind: 'text',
+        label: 'Name',
+        placeholder: current ? `${current.label} copy` : 'My theme',
+        get: () => this.themeName,
+        set: (v) => {
+          this.themeName = v
+        },
+        onSubmit: () => this.saveCurrentTheme(),
+      },
+      {
+        kind: 'row',
+        children: [
+          {
+            kind: 'button',
+            label: 'Save current look',
+            action: 'theme-save',
+            accent: true,
+            onClick: () => this.saveCurrentTheme(),
+          },
+          {
+            kind: 'button',
+            label: 'Delete selected',
+            action: 'theme-delete',
+            disabled: () => !selectedIsUser(),
+            onClick: () => this.deleteTheme(c.themeId),
+          },
+        ],
+      },
+      {
+        kind: 'note',
+        text: 'Saved themes live in this browser’s local storage under their own key, so resetting the settings profile on the System tab leaves them intact. Saving over an existing name replaces it.',
+      },
+      ...(this.themeMessage
+        ? [{ kind: 'readout' as const, label: 'Last action', get: () => this.themeMessage }]
+        : []),
+      { kind: 'heading', text: 'Panel chrome' },
+      {
+        kind: 'row',
+        children: [
+          {
+            kind: 'color',
+            label: 'Panel',
+            get: () => c.ui.panel,
+            set: (v) => {
+              c.ui.panel = v
+            },
+          },
+          {
+            kind: 'color',
+            label: 'Text',
+            get: () => c.ui.text,
+            set: (v) => {
+              c.ui.text = v
+            },
+          },
+          {
+            kind: 'color',
+            label: 'Accent',
+            get: () => c.ui.accent,
+            set: (v) => {
+              c.ui.accent = v
+            },
+          },
+        ],
+      },
+      {
+        kind: 'slider',
+        label: 'Panel opacity',
+        min: 0.3,
+        max: 1,
+        step: 0.01,
+        get: () => c.ui.opacity,
+        set: (v) => {
+          c.ui.opacity = v
+        },
+        format: fmt.pct,
+      },
+      {
+        kind: 'slider',
+        label: 'Backdrop blur',
+        min: 0,
+        max: 40,
+        step: 1,
+        get: () => c.ui.blur,
+        set: (v) => {
+          c.ui.blur = v
+        },
+        format: (v) => (v <= 0 ? 'off' : `${v.toFixed(0)} px`),
+      },
+      {
+        kind: 'slider',
+        label: 'Corner radius',
+        min: 0,
+        max: 24,
+        step: 1,
+        get: () => c.ui.radius,
+        set: (v) => {
+          c.ui.radius = v
+        },
+        format: (v) => `${v.toFixed(0)} px`,
+        hint: 'The muted, faint and border tones are alpha ramps of the text colour, and the panel switches to a light colour scheme on its own when its background is light.',
+      },
+      { kind: 'heading', text: 'Transfer' },
+      {
+        kind: 'row',
+        children: [
+          {
+            kind: 'button',
+            label: 'Copy current theme out',
+            action: 'theme-export',
+            onClick: () => {
+              this.themeTransfer = themeToJson(
+                themeFromConfig(this.deps.config, current?.label ?? 'Custom'),
+              )
+              this.themeMessage = 'Theme written below — copy it somewhere safe.'
+            },
+          },
+          {
+            kind: 'button',
+            label: 'Import from text',
+            action: 'theme-import',
+            onClick: () => this.importThemes(),
+          },
+        ],
+      },
+      {
+        kind: 'textarea',
+        label: 'Theme JSON',
+        rows: 6,
+        placeholder: 'Paste a theme here, then press Import.',
+        get: () => this.themeTransfer,
+        set: (v) => {
+          this.themeTransfer = v
+        },
+      },
+    ]
+  }
+
   private appearanceControls(c: Config): Control[] {
     const s = c.style
     return [
-      { kind: 'heading', text: 'Presets' },
       {
-        kind: 'row',
-        children: STYLE_PRESETS.map((preset) => ({
-          kind: 'button' as const,
-          label: preset.label,
-          action: `preset-${preset.id}`,
-          onClick: () => Object.assign(c.style, preset.style),
-        })),
+        kind: 'note',
+        text: 'These are the same values a theme carries. Change them here and the Theme tab will show the current theme as modified until you save it under a name.',
       },
       { kind: 'heading', text: 'Colours' },
       {
@@ -1255,6 +1640,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Line width',
+        keys: this.keysFor('Line width'),
         min: 0.5,
         max: 8,
         step: 0.1,
@@ -1267,6 +1653,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Intensity',
+        keys: this.keysFor('Intensity'),
         min: 0,
         max: 4,
         step: 0.01,
@@ -1279,6 +1666,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Phosphor persistence',
+        keys: this.keysFor('Phosphor persistence'),
         min: 0,
         max: 0.98,
         step: 0.01,
@@ -1293,6 +1681,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Curve',
+        keys: this.keysFor('Tone mapping'),
         options: [
           { value: 'clip', label: 'Clip' },
           { value: 'reinhard', label: 'Reinhard' },
@@ -1307,6 +1696,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Exposure',
+        keys: this.keysFor('Exposure'),
         min: 0.05,
         max: 8,
         step: 0.01,
@@ -1320,6 +1710,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Bloom',
+        keys: this.keysFor('Bloom'),
         min: 0,
         max: 2,
         step: 0.01,
@@ -1382,6 +1773,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Show grid',
+        keys: this.keysFor('Graticule'),
         get: () => s.showGrid,
         set: (v) => {
           s.showGrid = v
@@ -1390,6 +1782,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Show axis labels',
+        keys: this.keysFor('Axis labels'),
         get: () => s.showLabels,
         set: (v) => {
           s.showLabels = v
@@ -1398,6 +1791,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Show readout bar',
+        keys: this.keysFor('Readout bar'),
         get: () => s.showReadout,
         set: (v) => {
           s.showReadout = v
@@ -1423,6 +1817,25 @@ export class Overlay {
     const status = this.deps.status()
     const e = status.engine
     return [
+      { kind: 'heading', text: 'Display' },
+      {
+        kind: 'toggle',
+        label: 'Full screen',
+        keys: this.keysFor('Full screen'),
+        get: () => isFullscreen(),
+        set: () => void this.toggleFullscreen(),
+        disabled: () => !fullscreenSupported(),
+        hint: fullscreenSupported()
+          ? 'Takes the whole document, not just the canvas, so the controls come with it. Leave with f or esc.'
+          : 'This browser will not put a document into full screen. iOS Safari allows it for video elements only.',
+      },
+      {
+        kind: 'button',
+        label: 'Keyboard reference…',
+        action: 'show-keys',
+        onClick: () => this.help.open(),
+        hint: 'Every shortcut, generated from the same table the dispatcher runs. Also on ? or F1.',
+      },
       { kind: 'heading', text: 'Performance' },
       {
         kind: 'slider',
@@ -1533,8 +1946,10 @@ export class Overlay {
         action: 'reset-config',
         onClick: () => {
           Object.assign(c, structuredClone(DEFAULT_CONFIG))
+          this.syncChrome()
           this.rebuild()
         },
+        hint: 'Returns every control to its default. Saved themes are stored separately and survive this.',
       },
     ]
   }

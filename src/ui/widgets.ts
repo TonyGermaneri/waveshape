@@ -20,6 +20,7 @@ export type Control =
       get: () => string
       set: (v: string) => void
       hint?: string
+      keys?: readonly string[]
       disabled?: () => boolean
     }
   | {
@@ -34,6 +35,7 @@ export type Control =
       /** Maps the slider's 0..1 position to a value, for logarithmic controls. */
       curve?: 'linear' | 'log'
       hint?: string
+      keys?: readonly string[]
       disabled?: () => boolean
     }
   | {
@@ -42,14 +44,60 @@ export type Control =
       get: () => boolean
       set: (v: boolean) => void
       hint?: string
+      keys?: readonly string[]
       disabled?: () => boolean
     }
   | { kind: 'color'; label: string; get: () => string; set: (v: string) => void; hint?: string }
-  | { kind: 'button'; label: string; action: string; onClick: () => void; hint?: string }
+  | {
+      kind: 'button'
+      label: string
+      action: string
+      onClick: () => void
+      hint?: string
+      /** Renders as the primary action of its row. */
+      accent?: boolean
+      disabled?: () => boolean
+    }
+  | {
+      kind: 'text'
+      label: string
+      get: () => string
+      set: (v: string) => void
+      placeholder?: string
+      hint?: string
+      /** Called on Enter, so a name can be typed and committed without reaching for the mouse. */
+      onSubmit?: () => void
+    }
+  | {
+      kind: 'textarea'
+      label: string
+      get: () => string
+      set: (v: string) => void
+      rows?: number
+      placeholder?: string
+      hint?: string
+    }
+  | {
+      kind: 'swatches'
+      label: string
+      options: SwatchOption[]
+      get: () => string
+      set: (v: string) => void
+      hint?: string
+    }
   | { kind: 'readout'; label: string; get: () => string; hint?: string }
-  | { kind: 'note'; text: string }
+  | { kind: 'note'; text: string; tone?: 'plain' | 'warn' }
   | { kind: 'heading'; text: string }
   | { kind: 'row'; children: Control[] }
+
+export interface SwatchOption {
+  value: string
+  label: string
+  /** Background then up to three trace colours, drawn as a miniature of the theme. */
+  colors: readonly string[]
+  /** Shown as a small superscript tag, e.g. "saved". */
+  tag?: string
+}
 
 export interface ControlHandle {
   element: HTMLElement
@@ -83,6 +131,24 @@ function withHint(row: HTMLElement, hint?: string): HTMLElement {
   return wrap
 }
 
+/**
+ * The control's own name, with the keys that drive it printed beside it. The captions arrive
+ * pre-formatted from the caller: `keymap` reads `fmt` from this module, so this module must not
+ * read anything back out of `keymap`.
+ */
+function labelWith(text: string, keys?: readonly string[]): HTMLElement {
+  const span = el('span', 'ws-label', text)
+  if (!keys?.length) return span
+  const caps = el('span', 'ws-label-keys')
+  for (const cap of keys) {
+    const kbd = el('kbd')
+    kbd.textContent = cap
+    caps.append(kbd)
+  }
+  span.append(caps)
+  return span
+}
+
 const toSlider = (v: number, min: number, max: number, log: boolean): number => {
   if (!log) return (v - min) / (max - min)
   const lo = Math.log(Math.max(min, 1e-6))
@@ -104,7 +170,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
       return { element: node, refresh: () => {} }
     }
     case 'note': {
-      const node = el('p', 'ws-note', control.text)
+      const node = el('p', control.tone === 'warn' ? 'ws-note ws-note-warn' : 'ws-note', control.text)
       return { element: node, refresh: () => {} }
     }
     case 'row': {
@@ -115,7 +181,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
     }
     case 'select': {
       const row = el('label', 'ws-control')
-      row.append(el('span', 'ws-label', control.label))
+      row.append(labelWith(control.label, control.keys))
       const select = el('select', 'ws-select')
       for (const option of control.options) {
         const opt = el('option')
@@ -138,7 +204,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
     }
     case 'slider': {
       const row = el('label', 'ws-control')
-      const labelEl = el('span', 'ws-label', control.label)
+      const labelEl = labelWith(control.label, control.keys)
       const valueEl = el('span', 'ws-value')
       const head = el('span', 'ws-control-head')
       head.append(labelEl, valueEl)
@@ -185,7 +251,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
         control.set(input.checked)
         onChange(true)
       })
-      row.append(input, el('span', 'ws-label', control.label))
+      row.append(input, labelWith(control.label, control.keys))
       return {
         element: withHint(row, control.hint),
         refresh: () => {
@@ -211,14 +277,106 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
       }
     }
     case 'button': {
-      const button = el('button', 'ws-button', control.label)
+      const button = el('button', control.accent ? 'ws-button ws-button-accent' : 'ws-button', control.label)
       button.type = 'button'
       button.dataset.action = control.action
       button.addEventListener('click', () => {
         control.onClick()
         onChange(true)
       })
-      return { element: withHint(button, control.hint), refresh: () => {} }
+      return {
+        element: withHint(button, control.hint),
+        refresh: () => {
+          button.disabled = control.disabled?.() ?? false
+        },
+      }
+    }
+    case 'text': {
+      const row = el('label', 'ws-control')
+      row.append(el('span', 'ws-label', control.label))
+      const input = el('input', 'ws-input')
+      input.type = 'text'
+      if (control.placeholder) input.placeholder = control.placeholder
+      input.addEventListener('input', () => {
+        control.set(input.value)
+        onChange(false)
+      })
+      input.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return
+        event.preventDefault()
+        control.onSubmit?.()
+        onChange(true)
+      })
+      row.append(input)
+      return {
+        element: withHint(row, control.hint),
+        refresh: () => {
+          // Never write over a field being typed into: the caret would jump to the end.
+          if (document.activeElement !== input) input.value = control.get()
+        },
+      }
+    }
+    case 'textarea': {
+      const row = el('label', 'ws-control')
+      row.append(el('span', 'ws-label', control.label))
+      const input = el('textarea', 'ws-input ws-textarea')
+      input.rows = control.rows ?? 5
+      input.spellcheck = false
+      if (control.placeholder) input.placeholder = control.placeholder
+      input.addEventListener('input', () => {
+        control.set(input.value)
+        onChange(false)
+      })
+      row.append(input)
+      return {
+        element: withHint(row, control.hint),
+        refresh: () => {
+          if (document.activeElement !== input) input.value = control.get()
+        },
+      }
+    }
+    case 'swatches': {
+      const wrap = el('div', 'ws-control')
+      wrap.append(el('span', 'ws-label', control.label))
+      const grid = el('div', 'ws-swatches')
+      const buttons: { node: HTMLButtonElement; value: string }[] = []
+      for (const option of control.options) {
+        const button = el('button', 'ws-swatch')
+        button.type = 'button'
+        button.dataset.value = option.value
+        button.title = option.label
+
+        const chip = el('span', 'ws-swatch-chip')
+        const [background, ...traces] = option.colors
+        chip.style.background = background ?? '#000'
+        for (const colour of traces.slice(0, 3)) {
+          const bar = el('span', 'ws-swatch-bar')
+          bar.style.background = colour
+          chip.append(bar)
+        }
+
+        const name = el('span', 'ws-swatch-name', option.label)
+        button.append(chip, name)
+        if (option.tag) button.append(el('span', 'ws-swatch-tag', option.tag))
+        button.addEventListener('click', () => {
+          control.set(option.value)
+          onChange(true)
+        })
+        grid.append(button)
+        buttons.push({ node: button, value: option.value })
+      }
+      wrap.append(grid)
+      return {
+        element: withHint(wrap, control.hint),
+        refresh: () => {
+          const current = control.get()
+          for (const b of buttons) {
+            const active = b.value === current
+            b.node.classList.toggle('ws-active', active)
+            b.node.setAttribute('aria-pressed', String(active))
+          }
+        },
+      }
     }
     case 'readout': {
       const row = el('div', 'ws-control ws-control-inline')
