@@ -25,7 +25,9 @@
 // Points whose correction is implausibly large are dropped rather than trusted: a large
 // displacement means |X_w| was near a spectral null, where the phase derivative is noise.
 // This is the standard practical gate on reassignment and it is what keeps the display from
-// filling with confetti during noise-like passages.
+// filling with confetti during noise-like passages. How much of that budget a surviving point
+// spent is kept rather than thrown away — it is the best available measure of how tone-like the
+// point is, and the harmonic life pass is built on it.
 
 struct Params {
   // x: l   y: channelCount   z: frameCount   w: variantCount
@@ -154,6 +156,13 @@ fn reassign(@builtin(global_invocation_id) gid: vec3<u32>) {
       } else {
         tRel = tRel + dt;
         freq = freq + dFreq;
+        // How far the point had to be moved is itself a measurement: a stable partial barely
+        // moves, and phase noise moves a long way before the gate above rejects it. The
+        // remaining range of the validity slot carries that, from 0.5 (moved as far as the
+        // gate allows) to 1.0 (did not need moving). Consumers that only ask "is this point
+        // real" still test `< 0.5` and are unaffected; life.wgsl reads it as coherence.
+        let spent = max(abs(dt) / max(P.d.z, 1e-6), abs(dFreq) / max(P.d.w, 1e-6));
+        valid = 0.5 + 0.5 * clamp(1.0 - spent, 0.0, 1.0);
       }
     }
   }

@@ -34,8 +34,29 @@ import {
   type Theme,
 } from './theme.ts'
 
-// Drawn rather than typed: ▶ and ❚❚ are rendered by a different font on every platform and
-// sit on a different baseline in each of them.
+// Drawn rather than typed. The glyphs for these — ▶ ❚❚ ⤢ ⌨ — are rendered by a different font
+// on every platform, sit on a different baseline in each, and half of them are missing outright
+// on some. A path is the same size everywhere and inherits `currentColor` for free.
+const svg = (body: string) =>
+  `<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false">${body}</svg>`
+
+const KEYBOARD_ICON = svg(
+  '<rect x="0.7" y="2.8" width="10.6" height="6.4" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.05"/>' +
+    '<rect x="2.5" y="4.6" width="1.1" height="1.1" rx="0.2"/>' +
+    '<rect x="5.45" y="4.6" width="1.1" height="1.1" rx="0.2"/>' +
+    '<rect x="8.4" y="4.6" width="1.1" height="1.1" rx="0.2"/>' +
+    '<rect x="3.6" y="6.9" width="4.8" height="1.1" rx="0.5"/>',
+)
+// Corners pointing out to fill the screen, and in to leave it.
+const EXPAND_ICON = svg(
+  '<path d="M1 4.6V1h3.6v1.4H2.4v2.2zM7.4 1H11v3.6H9.6V2.4H7.4zM11 7.4V11H7.4V9.6h2.2V7.4zM4.6 11H1V7.4h1.4v2.2h2.2z"/>',
+)
+const CONTRACT_ICON = svg(
+  '<path d="M4.6 1v3.6H1V3.2h2.2V1zM11 3.2v1.4H7.4V1h1.4v2.2zM7.4 11V7.4H11v1.4H8.8V11zM1 8.8V7.4h3.6V11H3.2V8.8z"/>',
+)
+// A chevron toward the edge the panel lives on: it tucks away rather than closing.
+const HIDE_ICON = svg('<path d="M4.2 1.9 8.3 6l-4.1 4.1-1.2-1.2L5.9 6 3 3.1z"/>')
+
 const PLAY_ICON =
   '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M3.2 2.1 9.6 6 3.2 9.9z"/></svg>'
 const RESET_ICON =
@@ -59,6 +80,7 @@ const TABS = [
   'Waveform',
   'Spectrum',
   'Spectrogram',
+  'Life',
   'Meters',
   'Theme',
   'Appearance',
@@ -122,6 +144,14 @@ export class Overlay {
   private selfTestResult = ''
   private labelPool: HTMLElement[] = []
   private toastTimer = 0
+  private touched = false
+  /**
+   * The status the current frame reported. Every live readout reads through this rather than
+   * calling `deps.status()` itself: one call per frame instead of one per readout, and — the
+   * reason it exists — a `get` closure that reads it sees *this* frame rather than the frame
+   * the tab happened to be built on.
+   */
+  private lastStatus: OverlayStatus | null = null
 
   /** Which dividers exist, so a drag cannot move one that is not on screen. */
   private axes: LayoutAxes = { x: true, y: true }
@@ -169,20 +199,14 @@ export class Overlay {
 
     const actions = document.createElement('div')
     actions.className = 'ws-header-actions'
-    const chip = (text: string, tooltip: string, onClick: () => void) => {
+    // Every button in this row is a square icon. The shortcut stays in the tooltip and the
+    // accessible name rather than on the face of the button: six labels along the top of a
+    // panel this narrow crowd out the thing the panel is for.
+    const icon = (glyph: string, label: string, onClick: () => void) => {
       const button = document.createElement('button')
       button.type = 'button'
-      button.className = 'ws-close'
-      button.textContent = text
-      button.title = tooltip
-      button.addEventListener('click', onClick)
-      return button
-    }
-    const transport = (icon: string, label: string, onClick: () => void) => {
-      const button = document.createElement('button')
-      button.type = 'button'
-      button.className = 'ws-close ws-transport'
-      button.innerHTML = icon
+      button.className = 'ws-close ws-icon'
+      button.innerHTML = glyph
       button.title = label
       button.setAttribute('aria-label', label)
       button.addEventListener('click', onClick)
@@ -190,12 +214,10 @@ export class Overlay {
     }
     // Transport sits at the head of the group: it is the only control here that touches the
     // signal rather than the view.
-    this.playButton = transport(PLAY_ICON, 'Start capture (r)', () => this.deps.onRestartSource())
-    this.stopButton = transport(STOP_ICON, 'Stop capture (shift R)', () => this.deps.onStopSource())
-    const resetButton = transport(RESET_ICON, 'Reset the pane layout to four equal quarters', () =>
-      this.resetSplit(),
-    )
-    this.fullscreenButton = chip('⤢  f', 'Full screen (f)', () => void this.toggleFullscreen())
+    this.playButton = icon(PLAY_ICON, 'Start capture (r)', () => this.deps.onRestartSource())
+    this.stopButton = icon(STOP_ICON, 'Stop capture (shift R)', () => this.deps.onStopSource())
+    const resetButton = icon(RESET_ICON, 'Reset the pane layout (\\)', () => this.resetSplit())
+    this.fullscreenButton = icon(EXPAND_ICON, 'Full screen (f)', () => void this.toggleFullscreen())
 
     const divider = document.createElement('span')
     divider.className = 'ws-header-divider'
@@ -205,9 +227,9 @@ export class Overlay {
       this.stopButton,
       resetButton,
       divider,
-      chip('⌨  ?', 'Keyboard reference (?)', () => this.toggleHelp()),
+      icon(KEYBOARD_ICON, 'Keyboard reference (?)', () => this.toggleHelp()),
       this.fullscreenButton,
-      chip('Hide  ·  esc', 'Hide the control panel (esc)', () => this.setVisible(false)),
+      icon(HIDE_ICON, 'Hide the control panel (esc)', () => this.setVisible(false)),
     )
     header.append(title, actions)
 
@@ -240,12 +262,18 @@ export class Overlay {
     return this.help.isOpen
   }
 
+  /** Told once a touch has been seen, so the dismissal hint names a gesture and not a key. */
+  noteTouchInput(): void {
+    this.touched = true
+  }
+
   setVisible(visible: boolean): void {
     this.visible = visible
     this.panel.classList.toggle('ws-hidden', !visible)
     // Anything could have moved while the panel was away — a shortcut, a preset, a theme — so
     // it comes back showing the truth rather than whatever it was displaying when it left.
     if (visible) this.rebuild()
+    else if (this.touched) this.notify('double tap for controls')
     else this.notify('space · esc · h  for controls        ?  for keys')
   }
 
@@ -346,8 +374,9 @@ export class Overlay {
 
   private syncFullscreenButton(): void {
     const on = isFullscreen()
-    this.fullscreenButton.textContent = on ? '⤡  f' : '⤢  f'
+    this.fullscreenButton.innerHTML = on ? CONTRACT_ICON : EXPAND_ICON
     this.fullscreenButton.title = on ? 'Leave full screen (f)' : 'Full screen (f)'
+    this.fullscreenButton.setAttribute('aria-label', this.fullscreenButton.title)
     this.fullscreenButton.setAttribute('aria-pressed', String(on))
   }
 
@@ -406,9 +435,15 @@ export class Overlay {
     this.body.scrollTop = scroll
   }
 
+  /** Reads through the per-frame cache, falling back to a fresh sample before the first frame. */
+  private get live(): OverlayStatus {
+    return (this.lastStatus ??= this.deps.status())
+  }
+
   /** Cheap per-frame update of live values without rebuilding DOM. */
   update(): void {
     const s = this.deps.status()
+    this.lastStatus = s
     this.syncTransport(s.engine)
     if (this.deps.config.style.showReadout) {
       this.readout.classList.remove('ws-hidden')
@@ -684,6 +719,8 @@ export class Overlay {
         return this.spectrumControls(c)
       case 'Spectrogram':
         return this.spectrogramControls(c)
+      case 'Life':
+        return this.lifeControls(c)
       case 'Meters':
         return this.meterControls(c)
       case 'Theme':
@@ -942,7 +979,10 @@ export class Overlay {
         set: (v) => {
           a.hop = Math.max(32, 1 << Math.round(Math.log2(v)))
         },
-        format: (v) => `${v} smp  ·  ${(status.engine.sampleRate / v || 0).toFixed(0)} fps`,
+        // Refreshed every frame, so it reads the live rate rather than the one in force when
+        // the tab was built. The hints around it are strings, baked at rebuild time, and that
+        // is fine: changing anything they quote rebuilds the tab anyway.
+        format: (v) => `${v} smp  ·  ${(this.live.engine.sampleRate / v || 0).toFixed(0)} fps`,
         hint: `Samples between analysis windows — this sets the true analysis rate, independent of the display refresh. Recommended overlap for this window is ${spec.optimalOverlapPct}%.`,
       },
       {
@@ -1499,34 +1539,195 @@ export class Overlay {
     ]
   }
 
+  private lifeControls(c: Config): Control[] {
+    const l = c.life
+    const num = (
+      label: string,
+      key: keyof Config['life'],
+      min: number,
+      max: number,
+      step: number,
+      format: (v: number) => string,
+      hint?: string,
+      curve?: 'log',
+    ): Control => ({
+      kind: 'slider',
+      label,
+      min,
+      max,
+      step,
+      curve,
+      get: () => l[key] as number,
+      set: (v) => {
+        ;(l[key] as number) = v
+      },
+      format,
+      disabled: () => !l.enabled,
+      hint,
+    })
+
+    return [
+      {
+        kind: 'note',
+        text: 'The reassignment pass measures where energy is. This turns each of those measurements into an organism that knows what it is harmonically, and then lets it live: it senses at small integer ratios of its own frequency, migrates toward exact ratio with whatever it finds, and dies at a rate set by how tonal it was at birth.',
+      },
+      { kind: 'heading', text: 'Population' },
+      {
+        kind: 'toggle',
+        label: 'Harmonic life',
+        get: () => l.enabled,
+        set: (v) => {
+          l.enabled = v
+        },
+        hint: 'Replaces the spectrogram’s palette with the particles’ own colours: hue is chroma, so every octave of a note is one colour, and saturation is how sure the organism is that it is a note at all rather than noise.',
+      },
+      {
+        kind: 'slider',
+        label: 'Population',
+        min: 500,
+        max: 200000,
+        step: 500,
+        curve: 'log',
+        get: () => l.population,
+        set: (v) => {
+          l.population = Math.round(v)
+        },
+        format: (v) => `${v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v.toFixed(0)} alive`,
+        disabled: () => !l.enabled,
+        hint: 'How many may be alive at once. Slots are handed out in birth order, so when the cap is reached the ring comes back round to the oldest particle and takes it — culling by age costs nothing because it is what a ring already does.',
+      },
+      num('Lifespan', 'lifespan', 0, 20000, 10, (v) => (v <= 0 ? 'until spent or off screen' : `${v.toFixed(0)} steps`), 'Zero is no clock at all: a particle then lives until its energy runs out, until it wanders off the top or bottom of the display, or until the population cap claims it.'),
+      {
+        kind: 'toggle',
+        label: 'Wrap the frequency axis',
+        get: () => l.wrap,
+        set: (v) => {
+          l.wrap = v
+        },
+        disabled: () => !l.enabled,
+        hint: 'Leave the top and re-enter at the bottom. For an organism that lives on ratios this is not an arbitrary teleport — it arrives back at the same pitch class, an octave relationship away from where it left.',
+      },
+      num('Birth threshold', 'birthThreshold', 0.00001, 0.02, 0.00001, (v) => `${(20 * Math.log10(v)).toFixed(0)} dB`, 'Quieter points are measured but not animated. Raising this is the difference between a population and a fog.', 'log'),
+      num('Noise mortality', 'noiseMortality', 0, 6, 0.1, fmt.fixed(2), 'How much faster a particle born into a flat spectrum dies than one born on a peak.'),
+      num('Family bonus', 'supportBonus', 0, 1, 0.01, fmt.fixed(2), 'How much longer a partial lives for each sibling on its harmonic series. A note persists; a click does not.'),
+      { kind: 'heading', text: 'Behaviour' },
+      num('Harmonic pull', 'harmonicPull', 0, 1, 0.01, fmt.fixed(2), 'How strongly a particle is drawn into exact ratio with a partner it can hear. At zero the sensors still work but nothing acts on them; turned up, the population performs just intonation on whatever it is given.'),
+      num('Crowding', 'crowding', 0, 4, 0.05, fmt.fixed(2), 'How hard a particle in the middle of a crowd moves out of it. This is the term that opposes the harmonic pull — with it at zero the population converges onto its ratios and stops dead, and a partial is a line instead of a band that keeps rearranging itself.'),
+      num('Feeding', 'feed', 0.01, 1, 0.01, fmt.fixed(2), 'How fast a particle standing where the spectrum still has energy recovers. A particle grazes: stay on your partial and you are sustained, drift into a gap or outlive the note and you starve.'),
+      num('Occupancy before renewal', 'occupancy', 0.5, 24, 0.5, (v) => `${v.toFixed(1)} particles`, 'How many may already live at a frequency before new energy renews them instead of spawning more. This is what stops the population being a fountain of identical newborns overwritten on the spot — lower it for a sparse cast of long-lived individuals, raise it for a crowd.'),
+      num('Settling', 'settling', 0, 0.2, 0.002, (v) => (v <= 0 ? 'never settles' : `half still by ${(1 / v).toFixed(0)} steps`), 'How quickly a particle stops casting about as it ages. Every onset throws up a burst of searching that then settles, which is what an attack looks like.'),
+      num('Sensor spread', 'sensorCents', 5, 300, 1, (v) => `${v.toFixed(0)} cents`, 'How far above and below itself a particle listens for a ridge to follow — vibrato, a bent string, a siren.'),
+      num('Turn rate', 'turnCents', 0, 30, 0.5, (v) => `${v.toFixed(1)} cents`),
+      num('Drift limit', 'driftLimitCents', 1, 100, 1, (v) => `${v.toFixed(0)} cents/step`),
+      num('Momentum', 'damping', 0, 0.98, 0.01, fmt.fixed(2), 'Fraction of the previous step’s drift carried forward.'),
+      { kind: 'heading', text: 'Pheromone field' },
+      num('Trail decay', 'decay', 0.5, 0.999, 0.001, fmt.fixed(3), 'What survives each step. This is the organism’s memory, and it is the only thing letting one particle find another.'),
+      num('Diffusion', 'diffuse', 0, 1, 0.01, fmt.pct, 'Without it the field is a set of spikes and nothing ever senses anything.'),
+      num('Deposit', 'deposit', 0.05, 8, 0.05, fmt.fixed(2), undefined, 'log'),
+      num('Census floor', 'peakFloorDb', -140, -20, 1, fmt.db, 'Level a spectral peak must clear before it counts as a partial when the fundamental is inferred.'),
+      { kind: 'heading', text: 'In the other scopes' },
+      {
+        kind: 'note',
+        text: 'One organism, four windows onto it. The spectrum shows each particle at its own frequency and level — the domain it was born in. The vectorscope arranges them by pitch class around a circle, so every octave of a note lies on one spoke and a chord is a constellation. The waveform draws each living partial as the sine it claims to be: not a reconstruction, since the organism never measured phase and is not entitled to one, but its own account of what it is hearing, laid over the trace of what is actually there.',
+      },
+      num('Point size', 'pointSize', 0.5, 8, 0.1, (v) => `${v.toFixed(1)} px`),
+      num('Brightness', 'brightness', 0, 3, 0.05, fmt.fixed(2)),
+      num(
+        'Underlying scope',
+        'baseOpacity',
+        0,
+        1,
+        0.01,
+        (v) => (v <= 0 ? 'hidden' : v >= 1 ? 'full' : fmt.pct(v)),
+        'Opacity of the instrument beneath the organism — the waveform trace, the spectrum curve, the vectorscope figure. At zero only the population is left. The spectrogram is not affected: there the particles are the picture rather than a layer over it.',
+      ),
+      num('Resynthesised partials', 'traces', 0, 4096, 16, (v) => (v <= 0 ? 'off' : `${v.toFixed(0)} sines`), 'How many partials the waveform pane draws. Each is a polyline, so this is the one parameter here with a real frame-rate cost.'),
+      {
+        kind: 'note',
+        text: 'Every particle carries 58 bits of life beside its 24 bits of colour: which harmonic it is, how many cents sharp, how many siblings it has, how flat its neighbourhood was, whether it was born on a rising edge, its octave, how far reassignment had to move it, its age, its vitality, its cohort, and how many times new energy has renewed it.',
+      },
+    ]
+  }
+
   private meterControls(c: Config): Control[] {
-    const status = this.deps.status()
-    const l = status.loudness
+    // Everything below reads `this.live` at refresh time rather than closing over a snapshot.
+    // Capturing the status here was why this whole tab sat frozen on whatever the numbers had
+    // been at the moment it was opened.
+    const loud = () => this.live.loudness
     const num = (v: number | undefined) =>
       v === undefined || !Number.isFinite(v) ? '−∞' : v.toFixed(2)
+    /** Loudness and peak scales share a 60 dB window, which is what a meter bridge shows. */
+    const db60 = (v: number | undefined) =>
+      v === undefined || !Number.isFinite(v) ? 0 : (v + 60) / 60
     return [
       { kind: 'heading', text: 'ITU-R BS.1770-4 / EBU R 128' },
-      { kind: 'readout', label: 'Momentary (400 ms)', get: () => `${num(l?.momentary)} LUFS` },
-      { kind: 'readout', label: 'Short term (3 s)', get: () => `${num(l?.shortTerm)} LUFS` },
-      { kind: 'readout', label: 'Integrated (gated)', get: () => `${num(l?.integrated)} LUFS` },
-      { kind: 'readout', label: 'Loudness range', get: () => `${(l?.range ?? 0).toFixed(2)} LU` },
-      { kind: 'readout', label: 'True peak', get: () => `${num(l?.truePeakDb)} dBTP` },
-      { kind: 'readout', label: 'Sample peak', get: () => `${num(l?.samplePeakDb)} dBFS` },
-      { kind: 'readout', label: 'Correlation', get: () => (l?.correlation ?? 0).toFixed(3) },
+      {
+        kind: 'readout',
+        label: 'Momentary (400 ms)',
+        get: () => `${num(loud()?.momentary)} LUFS`,
+        meter: () => db60(loud()?.momentary),
+      },
+      {
+        kind: 'readout',
+        label: 'Short term (3 s)',
+        get: () => `${num(loud()?.shortTerm)} LUFS`,
+        meter: () => db60(loud()?.shortTerm),
+      },
+      {
+        kind: 'readout',
+        label: 'Integrated (gated)',
+        get: () => `${num(loud()?.integrated)} LUFS`,
+        meter: () => db60(loud()?.integrated),
+        // Over the delivery target is the one thing an integrated reading is checked for.
+        warn: () => {
+          const v = loud()?.integrated
+          return v !== undefined && Number.isFinite(v) && v > c.meters.targetLufs
+        },
+      },
+      {
+        kind: 'readout',
+        label: 'Loudness range',
+        get: () => `${(loud()?.range ?? 0).toFixed(2)} LU`,
+        meter: () => (loud()?.range ?? 0) / 20,
+      },
+      {
+        kind: 'readout',
+        label: 'True peak',
+        get: () => `${num(loud()?.truePeakDb)} dBTP`,
+        meter: () => db60(loud()?.truePeakDb),
+        warn: () => (loud()?.truePeakDb ?? -Infinity) > c.meters.truePeakCeilingDb,
+      },
+      {
+        kind: 'readout',
+        label: 'Sample peak',
+        get: () => `${num(loud()?.samplePeakDb)} dBFS`,
+        meter: () => db60(loud()?.samplePeakDb),
+        warn: () => (loud()?.samplePeakDb ?? -Infinity) > -0.1,
+      },
+      {
+        kind: 'readout',
+        label: 'Correlation',
+        get: () => (loud()?.correlation ?? 0).toFixed(3),
+        // Bipolar: it grows out of the centre, left for out of phase and right for in.
+        meter: () => ((loud()?.correlation ?? 0) + 1) / 2,
+        origin: 0.5,
+        warn: () => (loud()?.correlation ?? 0) < 0,
+      },
       {
         kind: 'readout',
         label: 'Integration time',
-        get: () => `${(l?.seconds ?? 0).toFixed(1)} s`,
+        get: () => `${(loud()?.seconds ?? 0).toFixed(1)} s`,
       },
       {
         kind: 'readout',
         label: 'Delivery check',
         get: () => {
+          const l = loud()
           if (!l || !Number.isFinite(l.integrated)) return 'measuring…'
           const dl = l.integrated - c.meters.targetLufs
           const tp = l.truePeakDb - c.meters.truePeakCeilingDb
-          const loud = `${dl >= 0 ? '+' : ''}${dl.toFixed(1)} LU vs target`
-          return tp > 0 ? `${loud}, true peak over by ${tp.toFixed(1)} dB` : loud
+          const text = `${dl >= 0 ? '+' : ''}${dl.toFixed(1)} LU vs target`
+          return tp > 0 ? `${text}, true peak over by ${tp.toFixed(1)} dB` : text
         },
       },
       { kind: 'heading', text: 'Targets' },
@@ -2016,8 +2217,9 @@ export class Overlay {
 
   private systemControls(c: Config): Control[] {
     const info = this.deps.gpuInfo
-    const status = this.deps.status()
-    const e = status.engine
+    // Read live, for the same reason as the meters: these are the numbers you watch while
+    // changing something else, and a frozen frame rate is worse than none.
+    const engine = () => this.live.engine
     return [
       { kind: 'heading', text: 'Panes' },
       ...PANE_SPECS.map((spec, index) => ({
@@ -2094,37 +2296,59 @@ export class Overlay {
         hint: 'Sample count is baked into the render pipelines; this takes effect on reload.',
       },
       { kind: 'heading', text: 'Status' },
-      { kind: 'readout', label: 'Display rate', get: () => `${status.fps.toFixed(1)} fps` },
+      {
+        kind: 'readout',
+        label: 'Display rate',
+        get: () => `${this.live.fps.toFixed(1)} fps`,
+        meter: () => this.live.fps / 120,
+        warn: () => this.live.fps < 30,
+      },
       {
         kind: 'readout',
         label: 'Analysis rate',
-        get: () => `${status.analysisFps.toFixed(1)} frames/s`,
+        get: () => `${this.live.analysisFps.toFixed(1)} frames/s`,
+        // Against the rate the current hop *should* produce, so the bar reads full when the
+        // pipeline is keeping up and short when it is falling behind — which is the only
+        // question worth asking of this number.
+        meter: () => {
+          const want = (engine().sampleRate || 48000) / Math.max(c.analysis.hop, 1)
+          return this.live.analysisFps / Math.max(want, 1)
+        },
+        warn: () => {
+          const want = (engine().sampleRate || 48000) / Math.max(c.analysis.hop, 1)
+          return this.live.analysisFps < want * 0.75
+        },
       },
-      { kind: 'readout', label: 'Frames dropped', get: () => String(status.dropped) },
-      { kind: 'readout', label: 'Ring overruns', get: () => String(status.lapped) },
+      { kind: 'readout', label: 'Frames dropped', get: () => String(this.live.dropped) },
+      { kind: 'readout', label: 'Ring overruns', get: () => String(this.live.lapped) },
       {
         kind: 'readout',
         label: 'Capture rate',
-        get: () => (e.sampleRate ? `${e.sampleRate} Hz` : '—'),
+        get: () => (engine().sampleRate ? `${engine().sampleRate} Hz` : '—'),
       },
       {
         kind: 'readout',
         label: 'Resampling',
-        get: () => (e.bitPerfectRate ? 'none — context matches device' : e.message || 'active'),
+        get: () =>
+          engine().bitPerfectRate
+            ? 'none — context matches device'
+            : engine().message || 'active',
       },
       {
         kind: 'readout',
         label: 'Input latency',
-        get: () => `${status.latencyMs.toFixed(2)} ms`,
+        get: () => `${this.live.latencyMs.toFixed(2)} ms`,
+        meter: () => this.live.latencyMs / 50,
+        warn: () => this.live.latencyMs > 25,
       },
       {
         kind: 'readout',
         label: 'Shared memory',
         get: () =>
-          e.sharedMemory
+          engine().sharedMemory
             ? 'SharedArrayBuffer ring (lock-free)'
             : 'postMessage transfer fallback',
-        hint: status.crossOriginIsolated
+        hint: this.live.crossOriginIsolated
           ? undefined
           : 'This document is not cross-origin isolated, so SharedArrayBuffer is unavailable. Serve with COOP: same-origin and COEP: require-corp for the lock-free path.',
       },

@@ -126,6 +126,73 @@ export interface Config {
     targetLufs: number
     truePeakCeilingDb: number
   }
+  /**
+   * The harmonic organism. Every parameter here is a property of a life form rather than of a
+   * measurement, which is why they live apart from `analysis` — nothing in this block changes
+   * what the signal *is*, only what grows on top of it.
+   */
+  life: {
+    enabled: boolean
+    /** How far above and below itself a particle listens, in cents. */
+    sensorCents: number
+    /** How hard it turns toward the louder spatial sensor, in cents per step. */
+    turnCents: number
+    /** How strongly it is drawn into exact ratio with a harmonic partner, 0 = not at all. */
+    harmonicPull: number
+    /** Fraction of the previous step's drift carried forward. Momentum, effectively. */
+    damping: number
+    /** Fraction of the pheromone field surviving each step. */
+    decay: number
+    /** How much of each field bin is smeared into its neighbours, 0..1. */
+    diffuse: number
+    /** Scales what a particle leaves behind relative to its energy. */
+    deposit: number
+    /**
+     * Steps a particle may live before it dies of age. Zero means no clock: it lives until its
+     * energy is spent, until it leaves the screen, or until the population cap claims it.
+     */
+    lifespan: number
+    /** How many particles may be alive at once. The oldest is culled to make room. */
+    population: number
+    /** Wrap the frequency axis into a loop instead of letting particles leave the screen. */
+    wrap: boolean
+    /**
+     * How hard a particle sitting in a crowd moves out of it. This is the term that opposes
+     * the harmonic pull; with it at zero the population converges and stops.
+     */
+    crowding: number
+    /** How quickly a particle stops casting about as it ages. 0 keeps it restless for ever. */
+    settling: number
+    /** How fast a particle standing in energy recovers its vitality. */
+    feed: number
+    /**
+     * How many particles a frequency may already hold before new energy renews them instead of
+     * spawning more. This is what stops the population being a fountain of clones.
+     */
+    occupancy: number
+    /** Amplitude a reassigned point must carry before it is worth animating. */
+    birthThreshold: number
+    /** How much faster a noise-born particle dies than a tonal one. */
+    noiseMortality: number
+    /** How much longer a particle with a large harmonic family lives. */
+    supportBonus: number
+    /** Cents per step a particle may migrate. */
+    driftLimitCents: number
+    /** Level a spectral peak must clear before the census counts it as a partial. */
+    peakFloorDb: number
+    /** Radius of a particle where it is drawn as a point, in pixels. */
+    pointSize: number
+    /** How brightly the population is drawn over the other three scopes. */
+    brightness: number
+    /**
+     * Opacity of the scope underneath — the waveform trace, the spectrum curve, the
+     * vectorscope figure. Dropping it to zero leaves only the organism; 1 leaves the
+     * instrument untouched and the population purely additive over it.
+     */
+    baseOpacity: number
+    /** How many partials the waveform pane resynthesises. Each one costs a polyline. */
+    traces: number
+  }
   style: {
     background: string
     primary: string
@@ -245,6 +312,32 @@ export const DEFAULT_CONFIG: Config = {
   meters: {
     targetLufs: -14,
     truePeakCeilingDb: -1,
+  },
+  life: {
+    enabled: false,
+    sensorCents: 45,
+    turnCents: 7,
+    harmonicPull: 0.35,
+    damping: 0.82,
+    decay: 0.94,
+    diffuse: 0.55,
+    deposit: 1.6,
+    lifespan: 0,
+    population: 24000,
+    wrap: false,
+    crowding: 1.4,
+    settling: 0.02,
+    feed: 0.12,
+    occupancy: 2.5,
+    birthThreshold: 0.0004,
+    noiseMortality: 2.2,
+    supportBonus: 0.28,
+    driftLimitCents: 25,
+    peakFloorDb: -75,
+    pointSize: 1.6,
+    brightness: 0.8,
+    baseOpacity: 1,
+    traces: 256,
   },
   style: {
     background: '#000000',

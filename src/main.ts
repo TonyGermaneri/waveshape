@@ -6,6 +6,7 @@ import { AudioRing, type RingReader } from './audio/ring.ts'
 import { initGpu, WebGpuUnavailableError, type GpuContext } from './gpu/device.ts'
 import { Analyzer } from './gpu/analyzer.ts'
 import { Renderer } from './gpu/renderer.ts'
+import { Life } from './gpu/life.ts'
 import { buildGraticule } from './ui/axes.ts'
 import { computeLayoutPair } from './ui/layout.ts'
 import { Overlay, type OverlayStatus } from './ui/overlay.ts'
@@ -62,6 +63,7 @@ async function main(): Promise<void> {
 
   const analyzer = new Analyzer(device)
   let renderer = new Renderer(device, gpu.context, gpu.format, analyzer, config.perf.msaa ? 4 : 1)
+  const life = new Life(device, analyzer)
   const engine = new AudioEngine()
 
   // ------------------------------------------------------------------ metering
@@ -148,6 +150,7 @@ async function main(): Promise<void> {
       engine.setMonitorGain(config.source.monitorGain)
       analyzer.attach(engine.ring)
       renderer.invalidate()
+      life.reset()
       attachMeters(engine.ring)
       overlay.setDevices(await engine.listInputs())
       armResumeOnGesture()
@@ -169,6 +172,7 @@ async function main(): Promise<void> {
     await engine.stop()
     analyzer.attach(null)
     renderer.invalidate()
+    life.reset()
     attachMeters(null)
   }
 
@@ -389,6 +393,35 @@ async function main(): Promise<void> {
     },
   }
 
+  // Double tap to show or hide the panel.
+  //
+  // A phone has no escape key, and a control surface that covers most of a small screen has to
+  // be dismissable by the screen itself. Restricted to touch on purpose: a mouse already has
+  // both a keyboard and a visible button, and a stray double click on the canvas making the
+  // panel vanish would be a poor trade for a gesture nobody needed.
+  let lastTapAt = 0
+  let lastTapX = 0
+  let lastTapY = 0
+  window.addEventListener('pointerup', (event) => {
+    if (event.pointerType !== 'touch') return
+    overlay.noteTouchInput()
+    // A tap that lands on a control belongs to that control, not to the canvas behind it.
+    const target = event.target as Element | null
+    if (target?.closest?.('.ws-panel, .ws-grab, .ws-dialog, .ws-toast')) return
+
+    const near = Math.hypot(event.clientX - lastTapX, event.clientY - lastTapY) < 44
+    if (event.timeStamp - lastTapAt < 320 && near) {
+      overlay.toggle()
+      // Cleared rather than updated, so a third tap starts a fresh pair instead of toggling
+      // again on every tap of a rapid sequence.
+      lastTapAt = 0
+      return
+    }
+    lastTapAt = event.timeStamp
+    lastTapX = event.clientX
+    lastTapY = event.clientY
+  })
+
   window.addEventListener('keydown', (event) => {
     // The modal reference owns the keyboard while it is up, including Escape, which the dialog
     // element handles itself.
@@ -494,7 +527,12 @@ async function main(): Promise<void> {
     const open = (mode: Mode) => panes.some((p) => p.visible && p.css.mode === mode)
     const wavePane = panes.find((p) => p.css.mode === 'wave')
     const spectrumPane = panes.find((p) => p.css.mode === 'spectrum')
-    const spectral = open('spectrum') || open('spectrogram')
+    // The organism is drawn in all four scopes, so it is wanted whenever any pane is open —
+    // but it eats the spectral chain's output, so wanting it is also a reason to run that
+    // chain. Without this the FFT would be switched off by a closed spectrogram and the
+    // population would starve in the three panes that were still showing it.
+    const living = config.life.enabled && panes.some((p) => p.visible)
+    const spectral = open('spectrum') || open('spectrogram') || living
 
     // The fixed span is what the trigger falls back to; when pitch-locked and confident, the
     // GPU replaces it with an exact number of detected periods.
@@ -541,6 +579,18 @@ async function main(): Promise<void> {
     })
     lastStats = stats
 
+    let particleCount = 0
+    if (living) {
+      particleCount = life.record(encoder, {
+        config,
+        pointCount: stats.pointCount,
+        sampleRate,
+        spectrumBins: config.analysis.fftSize / 2 + 1,
+        viewLowHz: config.spectrogram.freqMin,
+        viewHighHz: Math.min(config.spectrogram.freqMax, nyquist),
+      })
+    }
+
     analysisFrameAccum += stats.frames
     const window = now - analysisWindowStart
     if (window > 500) {
@@ -564,6 +614,9 @@ async function main(): Promise<void> {
     renderer.render(encoder, {
       config,
       stats,
+      particles: particleCount > 0 ? life.particles : undefined,
+      particleCount,
+      lifeAllocator: life.allocator,
       panes: graticules.map(({ pane, seconds, graticule }) => ({
         mode: pane.device.mode,
         slot: pane.device.index,
@@ -594,6 +647,7 @@ async function main(): Promise<void> {
         config,
         engine,
         analyzer,
+        life,
         gpu,
         overlay,
         // Draws one frame on demand. The loop is driven by requestAnimationFrame, which a

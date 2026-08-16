@@ -85,7 +85,21 @@ export type Control =
       set: (v: string) => void
       hint?: string
     }
-  | { kind: 'readout'; label: string; get: () => string; hint?: string }
+  | {
+      kind: 'readout'
+      label: string
+      get: () => string
+      hint?: string
+      /**
+       * Draws a small bar beside the value. Returns 0..1; anything outside is clamped, because
+       * a meter that runs off its own scale is worse than one that pins.
+       */
+      meter?: () => number
+      /** Where the fill starts, 0..1. 0.5 makes a bipolar meter, for things like correlation. */
+      origin?: number
+      /** Colours the bar as out of spec — over a ceiling, past a target. */
+      warn?: () => boolean
+    }
   | { kind: 'note'; text: string; tone?: 'plain' | 'warn' }
   | { kind: 'heading'; text: string }
   | { kind: 'row'; children: Control[] }
@@ -381,11 +395,32 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
     case 'readout': {
       const row = el('div', 'ws-control ws-control-inline')
       const value = el('span', 'ws-value ws-value-wide')
-      row.append(el('span', 'ws-label', control.label), value)
+      row.append(el('span', 'ws-label', control.label))
+
+      let fill: HTMLElement | null = null
+      if (control.meter) {
+        row.classList.add('ws-has-vu')
+        const bar = el('span', 'ws-vu')
+        fill = el('span', 'ws-vu-fill')
+        bar.append(fill)
+        row.append(bar)
+      }
+      row.append(value)
+
+      const origin = control.origin ?? 0
       return {
         element: withHint(row, control.hint),
         refresh: () => {
           value.textContent = control.get()
+          if (!fill || !control.meter) return
+          const v = Math.min(1, Math.max(0, control.meter()))
+          // Drawn from the origin to the value rather than always from the left, so a bipolar
+          // meter grows out of its centre in whichever direction the number went.
+          const lo = Math.min(v, origin)
+          const hi = Math.max(v, origin)
+          fill.style.left = `${lo * 100}%`
+          fill.style.width = `${(hi - lo) * 100}%`
+          fill.classList.toggle('ws-vu-warn', control.warn?.() ?? false)
         },
       }
     }

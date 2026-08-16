@@ -113,6 +113,81 @@ transfer box for moving one between machines.
 
 ---
 
+## Harmonic life
+
+*Branch `harmonic-life`, and the reason it exists.*
+
+The reassignment pass produces a cloud of points: energy, located precisely in time and
+frequency, existing for exactly one frame. Turn **Life ▸ Harmonic life** on and each of those
+points becomes an organism instead — with a birth, a lineage, a behaviour and a death.
+
+A particle is 32 bytes. Twenty-four bits are its colour; fifty-eight more are what it was born
+knowing about its own harmonic situation:
+
+| | |
+| --- | --- |
+| **harmonic** | which harmonic of the inferred fundamental it is, or 0 for none |
+| **detune** | signed cents from the exact multiple |
+| **support** | how many other partials share its series — its family |
+| **flatness** | how noise-like the spectrum was where it appeared |
+| **onset** | whether it arrived on a rising edge or continued something already sounding |
+| **register** | which octave it lives in |
+| **coherence** | how far reassignment had to move it, which is the best available measure of how real it is |
+| **age · vitality** | how long it has lived and how much of its birth energy is left. Age is sixteen bits: a particle should be able to outlive the window it is drawn in |
+| **cohort · generation** | which note it belongs to, and how many times new energy has renewed it |
+
+The loop is Physarum's — sense, rotate, move, deposit, decay — with one substitution that
+changes what it means. A slime mould's sensors are placed *spatially*, a fixed distance ahead
+and to either side. These are placed at **small integer ratios** of the particle's own
+frequency. A particle does not ask "is there more of it slightly to my left"; it asks "is there
+anything an octave above me, a fifth below me, a twelfth above me" — and it migrates to bring
+itself into exact ratio with whatever answers. An organism made of these does just intonation
+for a living.
+
+Its life is its identity acting on it. Noise dies quickly because it was never a thing; a
+partial with a large family persists because a note is persisting. A coherent partial trusts its
+own frequency and is pulled only gently, while an incoherent one has little to lose and snaps to
+whatever it can find. The colour is the identity made visible: hue is chroma, so every octave of
+a note is one colour and a harmonic series reads as a repeating sequence rather than a ramp;
+saturation is how sure the organism is that this is a note at all.
+
+Fed a 220 Hz sawtooth, the census recovers a fundamental of 219.99 Hz and the particles born at
+1540 Hz report themselves as the seventh harmonic, zero cents out, with thirty siblings.
+
+### One organism, four windows
+
+The spectrogram is where the particles live; the other three scopes show what that means in the
+coordinates each already speaks, in the same colours, so a partial can be followed by eye from
+one pane to the next.
+
+| Pane | What the population looks like there |
+| --- | --- |
+| **Spectrum** | Each particle at its own frequency and level — the domain it was born in. The cloud sits on the curve it came from and drifts off it as the population migrates. |
+| **Vectorscope** | The chromatic circle. Angle is pitch class, so every octave of a note lies on one spoke and a harmonic series fans into a fixed figure. A chord is a constellation; a glissando is a rotation. |
+| **Waveform** | Each living partial drawn as the sine it claims to be. Not a reconstruction — the organism never measured phase and is not entitled to one — but its own account of what it is hearing, laid over the trace of what is actually there. |
+
+### What keeps it moving
+
+The first version of this stood perfectly still, and the reason is worth recording. A particle
+deposits at its own frequency and then reads its own trail back from both sensors at once, so it
+sits in a pheromone well of its own making with nothing to tell it which way to go. The harmonic
+pull is a spring, and a sawtooth is *already* in exact ratio everywhere, so it had nothing to
+correct. Nothing pushed back against anything.
+
+What makes it live is that company is not always wanted: a particle alone at a frequency seeks
+the crowd, and one in the middle of a crowd makes room — in proportion to how little family it
+has, so a partial with siblings holds station while a lone one has no reason to stay put. That
+tension never settles. A partial becomes a band that keeps rearranging itself rather than a
+thousand organisms stacked in single file pretending to be a spectrogram.
+
+Four compute passes per frame — `survey`, `birth`, `step`, `settle` — in `gpu/life.ts` and
+`gpu/shaders/life.wgsl`. The bit layout lives in `gpu/particle.ts` and is duplicated by hand in
+the shader; `particle.test.ts` pins the TypeScript side, because a packing that disagreed
+between the two would not crash, it would produce particles that behave plausibly and mean
+nothing.
+
+---
+
 ## Signal path
 
 ```

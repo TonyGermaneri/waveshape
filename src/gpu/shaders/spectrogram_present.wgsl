@@ -13,7 +13,7 @@ struct PresentParams {
   a: vec4<u32>,
   // x: visibleColumns   y: dbFloor   z: dbCeil   w: gain
   b: vec4<f32>,
-  // x: normalise by coverage (0/1)   y: unused   z: unused   w: unused
+  // x: normalise by coverage (0/1)   y: living (0/1)   z: unused   w: unused
   c: vec4<f32>,
 }
 
@@ -44,6 +44,22 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
   let v = 1.0 - in.uv.y;
 
   let texel = textureSampleLevel(history, historySampler, vec2<f32>(u, v), 0.0);
+
+  if (V.c.y > 0.5) {
+    // Living: the particles brought their own colours, which carry harmonic identity — chroma
+    // is position in the octave, saturation is how sure the organism is that this is a note.
+    // A palette here would throw all of that away and re-encode a scalar it already has.
+    let coverage = max(texel.a, 1e-6);
+    let energy = coverage * V.b.w;
+    let db = 10.0 * log2(max(energy, 1e-20)) * 0.30102999566;
+    let t = clamp((db - V.b.y) / max(V.b.z - V.b.y, 1e-6), 0.0, 1.0);
+    // Normalising by coverage recovers the average colour of everything that landed here;
+    // brightness then comes from the level, exactly as it does in the palette path.
+    let tint = texel.rgb / coverage;
+    let a = S.geom.y * t;
+    return vec4<f32>(tint * a, a);
+  }
+
   var energy = texel.r * V.b.w;
   if (V.c.x > 0.5 && texel.g > 1e-6) {
     energy = energy / texel.g;

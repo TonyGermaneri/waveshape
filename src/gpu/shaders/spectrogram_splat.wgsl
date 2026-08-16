@@ -21,7 +21,7 @@ struct Params {
   b: vec4<f32>,
   // x: splatRadius px   y: gain   z: clear range 0 start   w: clear range 0 count
   c: vec4<f32>,
-  // x: clear range 1 start   y: clear range 1 count   z/w: unused
+  // x: clear range 1 start   y: clear range 1 count   z: columns advanced this frame   w: unused
   // Two ranges rather than two draws: the clear span can wrap around the end of the ring, and
   // queue.writeBuffer is ordered ahead of the entire command buffer, so re-writing the uniform
   // between two draws in the same pass would give both draws the second value.
@@ -30,11 +30,31 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> points: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> particles: array<Particle>;
+
+// Mirrors gpu/particle.ts. Only the four words this pass needs are read.
+struct Particle {
+  time: f32,
+  freq: f32,
+  energy: f32,
+  drift: f32,
+  colour: u32,
+  life0: u32,
+  life1: u32,
+  birthFreq: f32,
+}
 
 struct VSOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) offset: vec2<f32>,
   @location(1) @interpolate(flat) energy: f32,
+}
+
+struct LifeOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) offset: vec2<f32>,
+  @location(1) @interpolate(flat) tint: vec3<f32>,
+  @location(2) @interpolate(flat) energy: f32,
 }
 
 fn freqAxis(f: f32) -> f32 {
@@ -102,6 +122,74 @@ fn fsSplat(in: VSOut) -> @location(0) vec4<f32> {
   let k = exp(-3.5 * d2);
   let norm = 1.0 / (1.12 * r * r);
   return vec4<f32>(in.energy * k * norm, k * norm, 0.0, 0.0);
+}
+
+// ---------------------------------------------------------------------------------------
+// Living particles
+// ---------------------------------------------------------------------------------------
+//
+// A reassigned point is splatted where and when it was measured. A particle is splatted where
+// it is *now*: it was born somewhere, it has been migrating since, and it is still alive at the
+// head of the ring. That is the whole difference between a spectrogram and an organism living
+// in one — the trail a particle leaves across the columns is its own history, not the signal's.
+//
+// The quad is stretched across however many columns the head advanced this frame, because the
+// display runs at the monitor's refresh rate and the analysis does not. Without that a particle
+// would deposit one column in every twenty-four and its trail would be a dotted line.
+
+@vertex
+fn vsLife(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> LifeOut {
+  var out: LifeOut;
+  let q = particles[inst];
+  let alive = (q.colour >> 24u) & 1u;
+
+  if (alive == 0u || q.energy <= 0.0) {
+    out.pos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.offset = vec2<f32>(0.0, 0.0);
+    out.tint = vec3<f32>(0.0);
+    out.energy = 0.0;
+    return out;
+  }
+
+  let cols = f32(P.a.y);
+  let rows = f32(P.a.z);
+  let advanced = max(P.d.z, 1.0);
+
+  let colOffset = q.time / max(P.b.x, 1.0);
+  var colF = f32(P.a.w) + colOffset - advanced * 0.5;
+  colF = colF - floor(colF / cols) * cols;
+
+  let rowF = freqAxis(q.freq) * rows;
+
+  let c = corner(vi);
+  let r = max(P.c.x, 0.5);
+  let px = colF + 0.5 + c.x * (r + advanced * 0.5);
+  let py = rowF + 0.5 + c.y * r;
+
+  out.pos = vec4<f32>((px / cols) * 2.0 - 1.0, (py / rows) * 2.0 - 1.0, 0.0, 1.0);
+  // Only the frequency axis gets the Gaussian: stretching the kernel along time would make a
+  // long trail dimmer than a short one for no reason anybody could see.
+  out.offset = vec2<f32>(0.0, c.y * r);
+  out.tint = vec3<f32>(
+    f32((q.colour >> 16u) & 255u),
+    f32((q.colour >> 8u) & 255u),
+    f32(q.colour & 255u),
+  ) / 255.0;
+  // Vitality lives in bits 16..21 of life1, and is what makes a dying particle fade rather than
+  // vanish between one frame and the next.
+  let vitality = f32((q.life1 >> 16u) & 63u) / 63.0;
+  out.energy = q.energy * q.energy * vitality * P.c.y;
+  return out;
+}
+
+@fragment
+fn fsLife(in: LifeOut) -> @location(0) vec4<f32> {
+  let r = max(P.c.x, 0.5);
+  let d2 = dot(in.offset, in.offset) / (r * r);
+  let k = exp(-3.5 * d2);
+  let norm = 1.0 / (1.12 * r);
+  let e = in.energy * k * norm;
+  return vec4<f32>(in.tint * e, e);
 }
 
 // Wipes the columns that are about to be reused by the ring. Blending is disabled for this

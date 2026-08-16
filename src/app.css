@@ -352,31 +352,31 @@ body {
   background: var(--ws-line);
 }
 
-/* ---------------------------------------------------------------- transport */
+/* ---------------------------------------------------------------- header icons */
 
-.ws-transport {
+.ws-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
+  width: 24px;
   height: 22px;
   padding: 0;
 }
 
-.ws-transport svg {
-  width: 12px;
-  height: 12px;
+.ws-icon svg {
+  width: 13px;
+  height: 13px;
   fill: currentColor;
 }
 
-.ws-transport.ws-active {
+.ws-icon.ws-active {
   color: var(--ws-accent);
   border-color: var(--ws-accent-line);
   background: var(--ws-accent-soft);
 }
 
 /* Started, but held suspended by autoplay policy: running and not running at once. */
-.ws-transport.ws-pending {
+.ws-icon.ws-pending {
   color: var(--ws-accent);
   border-color: var(--ws-accent-line);
   animation: ws-pulse 1.4s ease-in-out infinite;
@@ -388,12 +388,12 @@ body {
   }
 }
 
-.ws-transport:disabled {
+.ws-icon:disabled {
   opacity: 0.32;
   cursor: default;
 }
 
-.ws-transport:disabled:hover {
+.ws-icon:disabled:hover {
   color: var(--ws-muted);
   border-color: var(--ws-line);
   background: transparent;
@@ -523,6 +523,42 @@ body {
 .ws-value-wide {
   margin-left: auto;
   color: var(--ws-muted);
+}
+
+/* ---------------------------------------------------------------- inline meters */
+
+/*
+ * A bar small enough to live inside a row that already existed. It is pushed right by its own
+ * auto margin, and the value gets a fixed width beside it so the bar does not jitter sideways
+ * every time the number changes width.
+ */
+.ws-vu {
+  position: relative;
+  flex: none;
+  width: 54px;
+  height: 4px;
+  margin-left: auto;
+  border-radius: 999px;
+  background: var(--ws-surface-strong);
+  overflow: hidden;
+}
+
+.ws-vu-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--ws-accent);
+  border-radius: 999px;
+}
+
+.ws-vu-fill.ws-vu-warn {
+  background: #ff5a4d;
+}
+
+.ws-has-vu .ws-value-wide {
+  margin-left: 8px;
+  min-width: 68px;
+  text-align: right;
 }
 
 .ws-hint {
@@ -1027,7 +1063,7 @@ body {
     transition: none;
   }
 
-  .ws-transport.ws-pending {
+  .ws-icon.ws-pending {
     animation: none;
   }
 
