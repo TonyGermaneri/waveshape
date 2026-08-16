@@ -33,8 +33,8 @@ export const FIELD_OCTAVES = 10
 export const PARTICLE_CAPACITY = 1 << 18
 
 const CENSUS_BYTES = 16 + 32 * 8
-/** Eight vec4s. Kept in step with `Params` in life.wgsl. */
-const PARAM_BYTES = 8 * 16
+/** Nine vec4s. Kept in step with `Params` in life.wgsl. */
+const PARAM_BYTES = 9 * 16
 
 export interface LifeFrame {
   config: Config
@@ -234,8 +234,12 @@ export class Life {
     f[27] = life.settling
     f[28] = life.feed
     f[29] = life.occupancy
-    f[30] = 0
-    f[31] = 0
+    f[30] = life.roam
+    f[31] = life.vibrato
+    f[32] = life.stamina
+    f[33] = life.dissonance
+    f[34] = life.surfacePull
+    f[35] = 0
     this.device.queue.writeBuffer(this.params, 0, this.scratch, 0, PARAM_BYTES)
 
     const [a, b] = this.ensureBinds()

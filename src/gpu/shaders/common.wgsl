@@ -89,6 +89,17 @@ fn segmentVertex(p0: vec2<f32>, p1: vec2<f32>, width: f32, corner: u32, res: vec
   return out;
 }
 
+/// Pushes a colour's chroma away from its own luminance. 1 leaves it exactly as it was; above
+/// one recovers saturation that averaging has taken out; 0 is grey.
+///
+/// Clamped at zero rather than allowed to go negative, because past a certain boost the weakest
+/// channel of a colour goes below black and comes back as the complementary hue — a colour that
+/// was slightly warm turning cyan is not more saturated, it is a different colour.
+fn withSaturation(rgb: vec3<f32>, amount: f32) -> vec3<f32> {
+  let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return max(mix(vec3<f32>(luma), rgb, amount), vec3<f32>(0.0));
+}
+
 /// Coverage for a line fragment: 1 at the centre, falling to 0 across the last pixel of width.
 fn lineCoverage(s: f32, width: f32) -> f32 {
   let half = max(width, 1.0) * 0.5;

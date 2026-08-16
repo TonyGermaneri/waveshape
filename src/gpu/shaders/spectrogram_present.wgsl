@@ -13,7 +13,7 @@ struct PresentParams {
   a: vec4<u32>,
   // x: visibleColumns   y: dbFloor   z: dbCeil   w: gain
   b: vec4<f32>,
-  // x: normalise by coverage (0/1)   y: living (0/1)   z: unused   w: unused
+  // x: normalise by coverage (0/1)   y: living (0/1)   z: organism saturation   w: unused
   c: vec4<f32>,
 }
 
@@ -55,7 +55,13 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     let t = clamp((db - V.b.y) / max(V.b.z - V.b.y, 1e-6), 0.0, 1.0);
     // Normalising by coverage recovers the average colour of everything that landed here;
     // brightness then comes from the level, exactly as it does in the palette path.
-    let tint = texel.rgb / coverage;
+    //
+    // But an average of hues is a grey. Thousands of organisms deposit into one texel over the
+    // life of a column, and however saturated each one was, the mean of enough of them is
+    // white — which is why a busy pane bleaches no matter what the blend mode does. Pushing the
+    // chroma back out afterwards is the only place this can be fixed: by the time the texel is
+    // read the individual colours are gone.
+    let tint = withSaturation(texel.rgb / coverage, V.c.z);
     let a = S.geom.y * t;
     return vec4<f32>(tint * a, a);
   }

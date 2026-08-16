@@ -9,6 +9,9 @@ import type { WindowId } from './dsp/windows.ts'
 
 export type Mode = 'wave' | 'spectrum' | 'spectrogram' | 'vector'
 
+/** How the living population merges with what is already on the target. */
+export type LifeBlend = 'add' | 'screen' | 'lighten'
+
 export type ChannelMode = 'left' | 'right' | 'mid' | 'side' | 'mono' | 'stereo'
 
 export type TriggerMode = 'free' | 'level' | 'pitch'
@@ -137,11 +140,39 @@ export interface Config {
     sensorCents: number
     /** How hard it turns toward the louder spatial sensor, in cents per step. */
     turnCents: number
-    /** How strongly it is drawn into exact ratio with a harmonic partner, 0 = not at all. */
+    /**
+     * How strongly it is drawn into exact ratio with a consonant partner. Negative repels
+     * consonance, which pulls a harmonic series apart instead of tightening it.
+     */
     harmonicPull: number
+    /**
+     * How hard a partner at a rough interval — a semitone, a tritone, a major seventh — pushes
+     * it away. This is what keeps two chords sounding at once from averaging into one cloud.
+     * Negative makes dissonance attractive.
+     */
+    dissonance: number
+    /**
+     * How strongly the scope surface underneath is felt. Hunger sets the sign: a starving
+     * particle climbs toward energy and a full one is pushed off it. Negative inverts the whole
+     * relationship, so the population avoids the signal it came from.
+     */
+    surfacePull: number
     /** Fraction of the previous step's drift carried forward. Momentum, effectively. */
     damping: number
-    /** Fraction of the pheromone field surviving each step. */
+    /**
+     * How far and how eagerly a particle walks its own harmonic series, regardless of where the
+     * energy currently is. This is the one behaviour that is not a reaction to the signal.
+     */
+    roam: number
+    /** Depth in cents of the intrinsic oscillation, whose rate is the particle's harmonic number. */
+    vibrato: number
+    /** Steps an unfed particle survives. How far it can travel before the journey kills it. */
+    stamina: number
+    /**
+     * Fraction of the pheromone field surviving each step. The field only — starvation has its
+     * own clock in `stamina`, because one knob cannot sensibly set both the organism's memory
+     * and its endurance.
+     */
     decay: number
     /** How much of each field bin is smeared into its neighbours, 0..1. */
     diffuse: number
@@ -180,18 +211,64 @@ export interface Config {
     driftLimitCents: number
     /** Level a spectral peak must clear before the census counts it as a partial. */
     peakFloorDb: number
-    /** Radius of a particle where it is drawn as a point, in pixels. */
+    /**
+     * How big a particle draws, in pixels — its splat radius in the spectrogram, its point
+     * radius in the spectrum and the vectorscope, the width of its sine in the waveform. One
+     * size in all four scopes, because it is one organism.
+     */
     pointSize: number
-    /** How brightly the population is drawn over the other three scopes. */
+    /** How brightly the population is drawn, in all four scopes. */
     brightness: number
     /**
-     * Opacity of the scope underneath — the waveform trace, the spectrum curve, the
-     * vectorscope figure. Dropping it to zero leaves only the organism; 1 leaves the
-     * instrument untouched and the population purely additive over it.
+     * How the population merges with whatever is already on the target. Additive is the house
+     * style and bleaches when the crowd is dense; screen rolls off toward white instead of
+     * through it; lighten keeps the brighter of the two and never mixes hues at all.
+     */
+    blend: LifeBlend
+    /**
+     * Chroma of the organism's own colours, applied where they are resolved rather than in
+     * post, so the instrument underneath keeps whatever the theme gave it. Above one this
+     * recovers the saturation that averaging thousands of hues in one texel takes away.
+     */
+    saturation: number
+    /**
+     * Phosphor: how many steps of a particle's own path are drawn behind it. The path is
+     * reconstructed from the particle's velocity and its intrinsic wobble rather than stored,
+     * so a trail costs a quad per step and no memory at all.
+     */
+    trail: number
+    /** Brightness retained per step back along the trail. */
+    trailFade: number
+    /**
+     * How much the particle's life properties bend its own trail — the wobble it draws into the
+     * phosphor and how much of the trail's brightness follows its vitality rather than its
+     * level. At zero every trail is a plain fading streak.
+     */
+    trailModulation: number
+    /**
+     * Opacity of the instrument underneath — the waveform trace, the spectrum curve, the
+     * vectorscope figure, and in the spectrogram the reassigned energy itself. Dropping it to
+     * zero leaves only the organism; 1 leaves the instrument untouched and the population
+     * purely additive over it.
      */
     baseOpacity: number
     /** How many partials the waveform pane resynthesises. Each one costs a polyline. */
     traces: number
+    /**
+     * How much of the spectrogram's safety margin to give up, 0..1. The display normally lags
+     * the write head by half an analysis window so that reassignment's backwards-in-time
+     * corrections have landed before a column is shown. A particle is not a correction — it is
+     * painted where it is now — so most of that margin is holding back an edge that is already
+     * final, and giving it up brings the organism's leading edge nearer to the present.
+     */
+    lead: number
+    /**
+     * Columns by which a quiet particle hangs back from the leading edge, so the edge is
+     * contoured by amplitude instead of being a ruled vertical line. The loudest thing in the
+     * frame touches the edge; everything else falls short of it in proportion to its level.
+     * Negative puts the loud ones behind instead.
+     */
+    amplitudeLead: number
   }
   style: {
     background: string
@@ -318,7 +395,12 @@ export const DEFAULT_CONFIG: Config = {
     sensorCents: 45,
     turnCents: 7,
     harmonicPull: 0.35,
+    dissonance: 0.6,
+    surfacePull: 1,
     damping: 0.82,
+    roam: 0.4,
+    vibrato: 20,
+    stamina: 240,
     decay: 0.94,
     diffuse: 0.55,
     deposit: 1.6,
@@ -336,8 +418,15 @@ export const DEFAULT_CONFIG: Config = {
     peakFloorDb: -75,
     pointSize: 1.6,
     brightness: 0.8,
+    blend: 'screen',
+    saturation: 1.4,
+    trail: 6,
+    trailFade: 0.86,
+    trailModulation: 1,
     baseOpacity: 1,
     traces: 256,
+    lead: 1,
+    amplitudeLead: 8,
   },
   style: {
     background: '#000000',

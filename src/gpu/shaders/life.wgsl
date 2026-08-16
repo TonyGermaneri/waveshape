@@ -56,8 +56,11 @@ struct Params {
   f: vec4<f32>,
   // x: wrap (0/1)   y: population cap   z: crowding   w: settling rate
   g: vec4<f32>,
-  // x: feed rate   y: occupancy a frequency may hold before births are suppressed   z/w: unused
+  // x: feed rate   y: occupancy a frequency may hold before births are suppressed
+  // z: roam   w: vibrato cents
   h: vec4<f32>,
+  // x: stamina (steps unfed)   y: dissonance   z: surface pull   w: unused
+  i: vec4<f32>,
 }
 
 struct Census {
@@ -119,13 +122,30 @@ fn packLife0(harmonic: u32, detuneCents: f32, support: u32, flatness: f32, onset
 }
 
 //  life1: age 0..15, vitality 16..21, cohort 22..27, generation 28..31
-fn packLife1(age: u32, vitality: f32, cohort: u32, generation: u32) -> u32 {
+//
+// `dither` is the fractional part added before the vitality quantiser rounds down, and it is
+// not a cosmetic detail. Vitality has six bits, so a level is 1/63; a starvation rate slower
+// than half of that per step rounds back to the value it started from and the particle becomes
+// immortal — which is exactly the range any usable stamina puts it in. Dithering with a
+// per-particle hash makes the rounding unbiased instead: a drain of a third of a level takes a
+// level away one step in three, so the population starves at the rate the knob says rather than
+// not at all. Pass 0.5 for plain rounding.
+fn packLife1(age: u32, vitality: f32, cohort: u32, generation: u32, dither: f32) -> u32 {
   var w = 0u;
   w = packField(w, min(age, 65535u), 0u, 16u);
-  w = packField(w, u32(clamp(vitality, 0.0, 1.0) * 63.0 + 0.5), 16u, 6u);
+  w = packField(w, u32(clamp(vitality, 0.0, 1.0) * 63.0 + clamp(dither, 0.0, 0.999)), 16u, 6u);
   w = packField(w, cohort & 63u, 22u, 6u);
   w = packField(w, min(generation, 15u), 28u, 4u);
   return w;
+}
+
+/// A stable 0..1 number for a slot, so a particle has a personality that does not change under
+/// it from one step to the next — unlike the per-frame hash the wander uses.
+fn slotHash(tid: u32) -> f32 {
+  var h = tid * 2654435761u + 0x9e3779b9u;
+  h = (h ^ (h >> 16u)) * 2246822519u;
+  h = (h ^ (h >> 13u)) * 3266489917u;
+  return f32(h >> 8u) / 16777216.0;
 }
 
 fn lifeAge(w: u32) -> u32 { return readField(w, 0u, 16u); }
@@ -213,6 +233,19 @@ fn foodAt(f: f32) -> f32 {
   return exp2(spectrum[u32(bin)] / 6.02059991328);
 }
 
+/// Which way is uphill between two sensor readings, and how confidently, in -1..1.
+///
+/// Saturating rather than a bare `sign`, and the difference matters more than it looks. A sign
+/// is full strength in whatever direction the readings differ, however slightly they differ —
+/// so a particle standing in a stretch of spectrum with nothing in it gets a full-strength shove
+/// from whichever sensor happened to catch a rounding error, and a sated one being pushed away
+/// from its partial would keep going at that speed until it left the display. Normalising by the
+/// total means the same direction and the same maximum where there really is a slope, and
+/// nothing at all where there is nothing to react to.
+fn slope(up: f32, down: f32) -> f32 {
+  return (up - down) / max(up + down, 1e-12);
+}
+
 /// Roughly how many particles are already sustaining the field at this frequency.
 ///
 /// A particle of amplitude `a` holds up `a * deposit / (1 - decay)` of field once it has
@@ -221,6 +254,82 @@ fn foodAt(f: f32) -> f32 {
 fn occupancy(f: f32, amp: f32) -> f32 {
   let unit = max(amp, 1e-12) * P.d.z / max(1.0 - P.d.x, 1e-3);
   return fieldAt(f) / max(unit, 1e-12);
+}
+
+// ---------------------------------------------------------------------------------------
+// Consonance: how an organism tells its own kind from somebody else's
+// ---------------------------------------------------------------------------------------
+//
+// A particle cannot read another particle's mind, and the field it senses through is a single
+// scalar over log frequency — there is nothing in it that says which note a neighbour came from.
+// It does not need one. The interval between two partials is the whole story: two members of the
+// same harmonic system always meet at a simple ratio, and members of two different systems
+// sounding at once meet, over and over, at sevenths and tritones and semitones.
+//
+// So the organism probes a fixed set of intervals and reacts by what it finds there. At a simple
+// ratio it pulls itself into exact tune with whatever answered; at a rough one it moves away.
+// Sound a G major triad and an A minor triad into it and the two do not average into a cloud —
+// each one's partials tighten onto their own series and the two series push each other apart,
+// because every cross-pair between them is one of the negative rows below.
+//
+// The affinities are ordered the way the intervals actually behave: octave and fifth are the
+// strongest agreements, thirds and sixths weaker ones, and the semitone is the strongest
+// disagreement there is — two partials a semitone apart beat at a rate the ear hears as
+// roughness, which is the physical fact this whole table stands on.
+const INTERVAL_COUNT: u32 = 16u;
+
+fn intervalRatio(i: u32) -> f32 {
+  var r = array<f32, 16>(
+    2.0, 0.5,              // octave
+    1.5, 0.6666667,        // perfect fifth
+    1.3333333, 0.75,       // perfect fourth
+    1.25, 0.8,             // major third
+    1.2, 0.8333333,        // minor third
+    1.0594631, 0.9438743,  // semitone
+    1.4142136, 0.7071068,  // tritone
+    1.8877486, 0.5297315,  // major seventh
+  );
+  return r[i];
+}
+
+fn intervalAffinity(i: u32) -> f32 {
+  var a = array<f32, 16>(
+    1.00, 1.00,
+    0.85, 0.85,
+    0.70, 0.70,
+    0.55, 0.55,
+    0.45, 0.45,
+    -1.00, -1.00,
+    -0.75, -0.75,
+    -0.60, -0.60,
+  );
+  return a[i];
+}
+
+// ---------------------------------------------------------------------------------------
+// The intrinsic wobble
+// ---------------------------------------------------------------------------------------
+//
+// Duplicated in life_draw.wgsl, which draws the phosphor trail by integrating this backwards.
+// The two must agree exactly or the trail will not lie on the path the particle took.
+
+/** Radians per step for a fundamental. A harmonic n wobbles n times as fast. */
+const VIBRATO_RATE: f32 = 0.021;
+/** Radians per step of the slow walk up and down the particle's own series. */
+const ROAM_RATE: f32 = 0.0165;
+
+/// How unsure a particle is that it is a note at all. Sets the depth of the wobble: a clean
+/// partial holds a taut line, one born into a flat spectrum shivers.
+fn unsureness(coherence: f32, flatness: f32) -> f32 {
+  return clamp(1.0 - coherence * 0.7 + flatness * 0.5, 0.0, 1.6);
+}
+
+/// Displacement in cents from the carrier, at a given age.
+fn vibratoAt(age: f32, harmonic: u32, phase: f32, depth: f32) -> f32 {
+  // The rate is the harmonic number, capped at the eighth: beyond that the flutter would be
+  // faster than the display can resolve and would read as noise rather than as shimmer.
+  let rate = VIBRATO_RATE * f32(clamp(harmonic, 1u, 8u));
+  return depth * sin(age * rate + phase);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -444,14 +553,29 @@ fn birth(@builtin(global_invocation_id) gid: vec3<u32>) {
     detune = 1200.0 * log2(freq / (f32(harmonic) * fundamental));
   }
   q.life0 = packLife0(harmonic, detune, support, flatness, onset, freq, coherence);
-  q.life1 = packLife1(0u, 1.0, census.cohort, generation);
+  q.life1 = packLife1(0u, 1.0, census.cohort, generation, 0.5);
   q.birthFreq = freq;
   particles[slot] = q;
 }
 
 // ---------------------------------------------------------------------------------------
-// Step: sense at ratios, steer, move, age, deposit
+// Step: sense the surface, read the intervals, walk your own road, age, deposit
 // ---------------------------------------------------------------------------------------
+//
+// Four things move a particle, and they are deliberately of different kinds:
+//
+//   the surface    the live spectrum underneath it, sensed a little above and a little below.
+//                  Not a rail: a slope. It is felt, not followed
+//   the crowd      the pheromone field — how many others are standing where it is standing
+//   the intervals  what ratio the others are at, which is how an organism with no way to read
+//                  a neighbour's mind still knows whether that neighbour is family
+//   its own road   the harmonic series it was born on, walked on a clock of its own, past
+//                  stations that may or may not have anything at them
+//
+// The last is the one that makes this a life rather than a rendering. The first three are all
+// reactions to something the signal did, and a particle with only those traces the tracks it was
+// measured from — a spectrogram with extra steps. The itinerary is nobody's business but the
+// particle's, and it is why the population crosses the tracks instead of lying on them.
 
 @compute @workgroup_size(64)
 fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -463,83 +587,89 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((flags & FLAG_ALIVE) == 0u) { return; }
 
   let age = lifeAge(q.life1);
+  let harmonic = life0Harmonic(q.life0);
   let coherence = life0Coherence(q.life0);
   let flatness = life0Flatness(q.life0);
   let support = life0Support(q.life0);
   let vitalityNow = lifeVitality(q.life1);
+  let hunger = clamp(1.0 - vitalityNow, 0.0, 1.0);
+  // A number belonging to this slot that does not change under it. Everything that makes one
+  // particle behave unlike a neighbour with identical birth properties comes from here.
+  let character = slotHash(tid);
+  let phase = character * 6.283185307;
 
-  // ---- sense ----------------------------------------------------------------------
-  //
-  // Spatial sensors, as Physarum has them: a little above and a little below. But a slime
-  // mould crawls away from where it deposited a moment ago, and a particle here does not — it
-  // deposits at its own frequency every step and then reads its own trail back, symmetrically,
-  // from both sensors at once. Left like that it sits in a pheromone well of its own making
-  // with nothing to tell it which way to go, and the population is a set of straight lines.
-  //
-  // What breaks the symmetry is that company is not always wanted. A particle alone at a
-  // frequency seeks the crowd; a particle in the middle of one makes room. The two together
-  // never settle: a partial becomes a band that keeps rearranging itself, rather than a
-  // thousand organisms stacked in a single file pretending to be a spectrogram.
   let spread = exp2(P.c.x / 1200.0);
   var turn = 0.0;
 
-  // Two signals, pulling opposite ways — which is the whole reason anything moves.
+  // ---- the surface ------------------------------------------------------------------
   //
-  // The first is food: the live spectrum, sensed a little above and a little below. A particle
-  // climbs toward it in proportion to how hungry it is, so a fed one holds its partial and a
-  // starving one hunts. This is the term that was missing. Sensing only the pheromone field
-  // meant sensing only where the particles already were, and a population that follows itself
-  // does not go anywhere; a population that follows the *signal* crawls onto every partial and
-  // keeps crawling as the partials move.
+  // Hunger decides the sign, and that inversion is the difference between an organism and a
+  // sediment. A starving particle climbs toward energy; a full one is pushed off it. Without
+  // the second half every particle parks on the loudest thing within reach and stays there, and
+  // the population settles into a picture of the spectrum — which is the picture the spectrum
+  // already draws for free, and the reason the spectrogram looked dead.
   //
-  // The second is kin: the field, which each particle contributes to. Where it is dense the
-  // particle is pushed out — less so the more family it has, since a partial with siblings is
-  // part of something and holds station while a lone one has no reason to stay.
-  //
-  // Together they make an ecology rather than a picture. A partial gathers particles until it
-  // is crowded, the crowd pushes some out, the ones pushed out are hungry, and hunger sends
-  // them looking for somewhere else to be.
-  let hunger = clamp(1.0 - vitalityNow, 0.0, 1.0);
-  let foodGradient = foodAt(q.freq * spread) - foodAt(q.freq / spread);
-  turn = turn + sign(foodGradient) * P.c.y * (0.25 + 0.75 * hunger);
+  // With it, a partial is somewhere particles *visit*. They arrive hungry, feed, fill up, are
+  // pushed off, travel, run down, and come back. The traffic is the life.
+  let appetite = hunger * 1.6 - 0.6;
+  let uphill = slope(foodAt(q.freq * spread), foodAt(q.freq / spread));
+  turn = turn + uphill * P.c.y * P.i.z * appetite;
 
-  let kinUp = fieldAt(q.freq * spread);
-  let kinDown = fieldAt(q.freq / spread);
+  // ---- the crowd --------------------------------------------------------------------
+  //
+  // The field, which every particle contributes to. Where it is dense the particle is pushed
+  // out — less so the more family it has, since a partial with siblings is part of something.
+  // But never to nothing: a series with eight members used to switch this term off entirely,
+  // which meant the richest and most interesting notes were the ones that stood stillest.
+  let denser = slope(fieldAt(q.freq * spread), fieldAt(q.freq / spread));
   let sociability = clamp(support / 8.0, 0.0, 1.0);
-  turn = turn - sign(kinUp - kinDown) * P.c.y * P.g.z * (1.0 - sociability);
+  turn = turn - denser * P.c.y * P.g.z * (0.35 + 0.65 * (1.0 - sociability));
 
-  // Harmonic sensors. Each ratio is a question: is there anything an octave above me, a fifth
-  // below me? The strongest answer becomes a pull toward the frequency that would make the
-  // relationship exact — which is the entire behaviour this organism exists to have.
+  // ---- the intervals ----------------------------------------------------------------
   //
-  // Unison is excluded — it is where the particle already is — and the set is deliberately
-  // small and low: these are the ratios a sustained tone actually produces, and adding more
-  // only makes everything attract everything.
-  var ratios = array<f32, 8>(2.0, 0.5, 1.5, 0.6666667, 3.0, 0.3333333, 4.0, 0.25);
-  var bestWeight = 0.0;
-  var bestTarget = q.freq;
-  for (var i = 0u; i < 8u; i = i + 1u) {
-    let ratio = ratios[i];
+  // Probe every interval in the table and let its affinity decide what to do with the answer.
+  // A consonant partner is family: move until the ratio is exact. A dissonant one belongs to
+  // some other harmonic system: move away from it. Two chords sounding at once are two
+  // populations that will not mix, and this loop is the entire reason why — nothing anywhere
+  // labels a particle with which chord it came from, and nothing needs to.
+  var pullCents = 0.0;
+  var pullWeight = 0.0;
+  var pushCents = 0.0;
+  var pushWeight = 0.0;
+  for (var i = 0u; i < INTERVAL_COUNT; i = i + 1u) {
+    let ratio = intervalRatio(i);
+    let affinity = intervalAffinity(i);
     let probe = fieldCentroid(q.freq * ratio, 2);
-    // Prefer simple ratios: an octave partner should outrank a distant twelfth.
-    let simplicity = 1.0 / (1.0 + abs(log2(ratio)));
-    let weight = probe.y * simplicity;
-    if (weight > bestWeight) {
-      bestWeight = weight;
-      bestTarget = probe.x / ratio;
+    if (probe.y <= 1e-9) { continue; }
+    if (affinity > 0.0) {
+      // Where this particle would have to stand for the ratio to be exact.
+      let want = 1200.0 * log2(max(probe.x / ratio, 1.0) / max(q.freq, 1.0));
+      let w = probe.y * affinity;
+      pullCents = pullCents + clamp(want, -120.0, 120.0) * w;
+      pullWeight = pullWeight + w;
+    } else {
+      // Away from the offender. Direction only: how hard is the affinity's business.
+      let offset = 1200.0 * log2(max(probe.x, 1.0) / max(q.freq, 1.0));
+      let w = probe.y * (-affinity);
+      pushCents = pushCents - sign(offset) * w;
+      pushWeight = pushWeight + w;
     }
   }
-  if (bestWeight > 0.0) {
-    let pullCents = clamp(1200.0 * log2(max(bestTarget, 1.0) / max(q.freq, 1.0)), -60.0, 60.0);
-    // A coherent partial trusts its own frequency and is pulled only gently; an incoherent one
+  if (pullWeight > 0.0) {
+    // A coherent partial trusts its own frequency and is drawn only gently; an incoherent one
     // has little to lose and snaps to whatever it can find.
-    turn = turn + pullCents * P.c.z * (1.0 - 0.6 * coherence);
+    turn = turn + (pullCents / pullWeight) * P.c.z * (1.0 - 0.6 * coherence);
+  }
+  if (pushWeight > 0.0) {
+    turn = turn + (pushCents / pushWeight) * P.c.y * P.i.y;
   }
 
-  // Wander. A particle born incoherent into a flat spectrum has no frequency worth holding and
-  // boils; a clean partial barely moves. The floor matters as much as the scaling, though —
-  // a perfectly symmetric density peak offers no direction at all, and without a little noise
-  // to break the tie the crowding tension above would freeze at its own fixed point.
+  // ---- wander -------------------------------------------------------------------------
+  //
+  // A particle born incoherent into a flat spectrum has no frequency worth holding and boils;
+  // a clean partial barely moves. The floor matters as much as the scaling, though — a
+  // perfectly symmetric density peak offers no direction at all, and without a little noise to
+  // break the tie the crowding tension above would freeze at its own fixed point.
   let restless = 0.12 + (1.0 - coherence) * (0.35 + 0.65 * flatness);
   if (restless > 0.01) {
     // Hashed from the slot and the frame counter: no RNG state to store, and two particles in
@@ -551,19 +681,56 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     turn = turn + noise * P.c.y * 4.0 * restless;
   }
 
+  // ---- tenure ---------------------------------------------------------------------------
+  //
   // Age reaches the motion, not only the mortality. A particle that has just arrived has no
-  // stake in where it is and casts about; one that has been holding a frequency for a long
-  // time has, by having survived there, earned the right to be left alone. Every onset
-  // therefore throws up a burst of searching that settles — which is what an attack looks
-  // like — and the floor keeps the settled ones from becoming furniture.
+  // stake in where it is and casts about; one that has been holding a frequency for a long time
+  // has, by having survived there, earned the right to be left alone. Every onset therefore
+  // throws up a burst of searching that settles, which is what an attack looks like.
   let settled = 1.0 / (1.0 + f32(age) * P.g.w);
   // Tenure quietens a particle, but hunger overrides it: an established resident whose partial
   // has stopped sounding is exactly the one that should be up and looking.
   turn = turn * mix(0.3 + 0.7 * settled, 1.0, hunger);
 
+  // ---- its own road -----------------------------------------------------------------------
+  //
+  // Added after the tenure damping rather than before it, and the order is the point. Everything
+  // above is a reaction, and a particle that has held its ground for a long time has earned the
+  // right to react less. An itinerary is not a reaction, and age is no reason to abandon one: an
+  // old organism is not a still one, it is one that has stopped being startled.
+  //
+  // A particle born as harmonic n walks up and down its own series on a clock of its own. One
+  // born into noise — harmonic 0, no series to speak of — has no road, and glides freely
+  // instead. A negative roam is a particle fleeing its own series rather than pacing it.
+  //
+  // The station is a *ratio* of the harmonic number, not an offset from it, and that is the
+  // difference between a spectrogram that moves and one that only moves in the buffer. Stepping
+  // n by a fixed count travels an interval that shrinks with register — from the first harmonic
+  // to the third is an octave and a fifth, from the twentieth to the twenty-second is a hundred
+  // and sixty cents — so a display whose upper two thirds are high partials sat perfectly still
+  // while the arithmetic said the population had moved. A ratio travels the same interval
+  // wherever it starts, and an interval is what a log-frequency axis is made of.
+  let reach = abs(P.h.z);
+  let sweep = sin(f32(age) * ROAM_RATE * (0.45 + 1.1 * character) + phase);
+  var station = q.birthFreq * exp2(sweep * reach * 1.5);
+  if (harmonic > 0u) {
+    let fundamental = q.birthFreq / f32(harmonic);
+    station = fundamental * max(0.25, f32(harmonic) * exp2(sweep * reach * 1.5));
+  }
+  let toStation = clamp(1200.0 * log2(max(station, 1.0) / max(q.freq, 1.0)), -1800.0, 1800.0);
+  turn = turn + toStation * 0.035 * P.h.z;
+
   // ---- move -----------------------------------------------------------------------
   q.drift = clamp(q.drift * P.c.w + turn, -P.e.w, P.e.w);
-  var freq = q.freq * exp2(q.drift / 1200.0);
+  // The wobble is a displacement, not a force: what is added each step is its derivative, so
+  // the accumulated position carries exactly the depth the knob asks for rather than whatever
+  // the momentum term happens to integrate it into. life_draw.wgsl runs the same function
+  // backwards to lay the phosphor trail along the path the particle actually took.
+  let depth = P.h.w * unsureness(coherence, flatness);
+  let wobble =
+    vibratoAt(f32(age), harmonic, phase, depth) -
+    vibratoAt(f32(age) - 1.0, harmonic, phase, depth);
+  var freq = q.freq * exp2((q.drift + wobble) / 1200.0);
 
   // Leaving the screen is the natural end of a life here. A particle that has wandered above
   // the top of the display or below the bottom is no longer part of anything anyone can see,
@@ -595,21 +762,32 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   // partial and you die of it.
   let food = foodAt(q.freq);
   let fed = food > P.e.x;
-  // Brightness follows the real level rather than a decaying memory of the birth level.
-  q.energy = mix(q.energy, food, 0.3);
+  // Rise to the level it is standing in quickly; fall away from it slowly.
+  //
+  // This was a symmetric mix toward the local level, and it hid every traveller. A particle
+  // that stepped off its partial went dark within a few frames, so a moving population looked
+  // exactly like a still one — the only particles bright enough to see were the ones that had
+  // not gone anywhere. Brightness is the particle's own state now, and it keeps enough of it to
+  // be watched crossing the gap.
+  q.energy = mix(q.energy, food, select(0.02, 0.4, food > q.energy));
 
   // ---- age ------------------------------------------------------------------------
-  // Mortality is a statement about what the particle is. Noise starves quickly because it was
-  // never a thing; a partial with a large family holds on because a note is persisting.
+  //
+  // Starvation has its own clock now. It used to borrow the pheromone field's decay, which
+  // meant there was no way to give a particle the endurance to cross a gap without also making
+  // the trail permanent — one knob doing two unrelated jobs, and the reason nothing ever
+  // survived a journey. `stamina` is how many steps an unfed particle of ordinary constitution
+  // lasts. Noise shortens it, because a click was never a thing; a large harmonic family
+  // lengthens it, because a note is persisting.
   let noisePenalty = 1.0 + flatness * P.e.y;
   let familyBonus = 1.0 + min(support, 12.0) * P.e.z;
-  let decay = pow(P.d.x, noisePenalty / familyBonus);
+  let drain = (noisePenalty / familyBonus) / max(P.i.x, 1.0);
 
   var vitality = vitalityNow;
   if (fed) {
-    vitality = vitality + (1.0 - vitality) * P.h.x;
+    vitality = min(1.0, vitality + (1.0 - vitality) * P.h.x);
   } else {
-    vitality = vitality * decay;
+    vitality = vitality - drain;
   }
   let nextAge = min(age + 1u, 65535u);
   // A lifespan of zero means no clock at all: the particle lives until its energy is spent,
@@ -621,7 +799,12 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     particles[tid] = q;
     return;
   }
-  q.life1 = packLife1(nextAge, vitality, lifeCohort(q.life1), lifeGeneration(q.life1));
+  // The dither is a low-discrepancy sequence per particle rather than a fresh hash: it advances
+  // by the golden ratio every frame, so the rounding error over any run of steps is bounded
+  // instead of merely zero-mean, and a long stamina drains at the rate it says even for the few
+  // hundred steps a particle actually lives.
+  let dither = fract(character + f32(P.a.w) * 0.6180339887);
+  q.life1 = packLife1(nextAge, vitality, lifeCohort(q.life1), lifeGeneration(q.life1), dither);
   // Being fed is worth recording: the draw passes use it, and it is the difference between a
   // particle that is sustaining a partial and one that is on its way out.
   if (fed) {

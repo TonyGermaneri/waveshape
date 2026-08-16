@@ -174,6 +174,13 @@ export interface Life1 {
 
 export const MAX_AGE = 65535
 
+/**
+ * The bit layout is what this mirrors, not the rounding. `life.wgsl` dithers the vitality
+ * quantiser with a per-particle sequence instead of rounding to nearest, because six bits make a
+ * level 1/63 and any starvation slower than half of that would round back to where it started —
+ * an immortal particle, silently, for every stamina worth setting. Here, where nothing is
+ * integrating a slow drain step by step, rounding to nearest is the honest thing.
+ */
 export function encodeLife1(state: Life1): number {
   return pack(LIFE1, {
     age: Math.min(MAX_AGE, Math.max(0, state.age)),

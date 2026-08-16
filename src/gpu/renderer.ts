@@ -20,7 +20,7 @@
  * the data goes in separate buffers or is selected by instance index.
  */
 
-import type { Config, Mode } from '../config.ts'
+import type { Config, LifeBlend, Mode } from '../config.ts'
 import { channelMix } from '../config.ts'
 import { hexToLinearRgb, paletteById, rasterisePalette } from './colormap.ts'
 import type { Analyzer, FrameStats } from './analyzer.ts'
@@ -49,6 +49,39 @@ const STYLE_BYTES = 160
 const ADDITIVE: GPUBlendState = {
   color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
   alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+}
+
+/**
+ * How the population merges with what is already on the target.
+ *
+ * Additive is right for an instrument: density becomes brightness, and two things in the same
+ * place are twice as bright as one. It is wrong for a population of tens of thousands of
+ * differently-coloured organisms, because summing enough hues gets you white however saturated
+ * each one was, and a crowded pane bleaches out.
+ *
+ * Screen sums the same way at low levels and rolls off toward one instead of past it, so
+ * density still reads as brightness but never as paper. Lighten keeps whichever of the two is
+ * brighter and does not sum at all: colours stay exactly as saturated as they were born, at the
+ * cost of density being invisible. All three are useful and none is a default for everything,
+ * which is why it is a knob.
+ */
+const LIFE_BLEND_MODES = ['add', 'screen', 'lighten'] as const
+
+/** Builds one of a thing per blend mode. */
+function byBlend<T>(make: (blend: LifeBlend) => T): Record<LifeBlend, T> {
+  return Object.fromEntries(LIFE_BLEND_MODES.map((b) => [b, make(b)])) as Record<LifeBlend, T>
+}
+
+const LIFE_BLENDS: Record<LifeBlend, GPUBlendState> = {
+  add: ADDITIVE,
+  screen: {
+    color: { srcFactor: 'one', dstFactor: 'one-minus-src', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src', operation: 'add' },
+  },
+  lighten: {
+    color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+    alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+  },
 }
 
 /** result = 0 * src + constant * dst — a multiply, driven by setBlendConstant. */
@@ -129,9 +162,15 @@ export class Renderer {
   private readonly spectrumPipeline: GPURenderPipeline
   private readonly vectorPipeline: GPURenderPipeline
   private readonly splatPipeline: GPURenderPipeline
-  private readonly lifePipeline: GPURenderPipeline
+  // One pipeline per blend mode. Blend state is baked into a pipeline and cannot be changed at
+  // draw time, so a switchable merge means a variant per mode — built once, chosen per frame.
+  private readonly lifePipeline: Record<LifeBlend, GPURenderPipeline>
+  private readonly historyBasePipeline: Record<LifeBlend, GPURenderPipeline>
   /** One per scope: spectrum points, vectorscope chroma, waveform sines. */
-  private readonly lifeDrawPipelines: Record<'spectrum' | 'vector' | 'wave', GPURenderPipeline>
+  private readonly lifeDrawPipelines: Record<
+    'spectrum' | 'vector' | 'wave',
+    Record<LifeBlend, GPURenderPipeline>
+  >
   private readonly lifeDrawLayout: GPUBindGroupLayout
   private readonly lifeDrawParams: Record<'spectrum' | 'vector' | 'wave', GPUBuffer>
   private lifeDrawBinds: Partial<Record<'spectrum' | 'vector' | 'wave', GPUBindGroup>> = {}
@@ -186,11 +225,11 @@ export class Renderer {
     // A buffer per scope rather than one reused three times: all three draws are in the same
     // submission, and writeBuffer is ordered ahead of the whole command buffer.
     this.lifeDrawParams = {
-      spectrum: device.createBuffer({ label: 'life-draw-spectrum', size: 48, usage: uni }),
-      vector: device.createBuffer({ label: 'life-draw-vector', size: 48, usage: uni }),
-      wave: device.createBuffer({ label: 'life-draw-wave', size: 48, usage: uni }),
+      spectrum: device.createBuffer({ label: 'life-draw-spectrum', size: 64, usage: uni }),
+      vector: device.createBuffer({ label: 'life-draw-vector', size: 64, usage: uni }),
+      wave: device.createBuffer({ label: 'life-draw-wave', size: 64, usage: uni }),
     }
-    this.splatParams = device.createBuffer({ label: 'splat', size: 64, usage: uni })
+    this.splatParams = device.createBuffer({ label: 'splat', size: 96, usage: uni })
     this.sgPresentParams = device.createBuffer({ label: 'sg-present', size: 48, usage: uni })
     // Three 256-byte-aligned slots: [0] the shared parameters, [1] horizontal blur,
     // [2] vertical blur. The blur direction is the only field that differs between the two
@@ -264,6 +303,7 @@ export class Renderer {
       vs: string,
       fs: string,
       layout: GPUBindGroupLayout | 'auto' = 'auto',
+      blend: GPUBlendState = ADDITIVE,
     ): GPURenderPipeline =>
       device.createRenderPipeline({
         label,
@@ -275,7 +315,7 @@ export class Renderer {
         fragment: {
           module: mod,
           entryPoint: fs,
-          targets: [{ format: SCENE_FORMAT, blend: ADDITIVE }],
+          targets: [{ format: SCENE_FORMAT, blend }],
         },
         primitive: { topology: 'triangle-list' },
         multisample: { count: sampleCount },
@@ -314,17 +354,24 @@ export class Renderer {
       },
       primitive: { topology: 'triangle-list' },
     })
-    this.lifePipeline = device.createRenderPipeline({
-      label: 'sg-life',
-      layout: splatPipelineLayout,
-      vertex: { module: splatModule, entryPoint: 'vsLife' },
-      fragment: {
-        module: splatModule,
-        entryPoint: 'fsLife',
-        targets: [{ format: SCENE_FORMAT, blend: ADDITIVE }],
-      },
-      primitive: { topology: 'triangle-list' },
-    })
+    const historyPipeline = (label: string, vs: string, fs: string) =>
+      byBlend((blend) =>
+        device.createRenderPipeline({
+          label,
+          layout: splatPipelineLayout,
+          vertex: { module: splatModule, entryPoint: vs },
+          fragment: {
+            module: splatModule,
+            entryPoint: fs,
+            targets: [{ format: SCENE_FORMAT, blend: LIFE_BLENDS[blend] }],
+          },
+          primitive: { topology: 'triangle-list' },
+        }),
+      )
+    this.lifePipeline = historyPipeline('sg-life', 'vsLife', 'fsLife')
+    // The same geometry as `splatPipeline`, written in the encoding the living present pass
+    // reads, so the measurement and the organism can share one history texture.
+    this.historyBasePipeline = historyPipeline('sg-base', 'vsSplat', 'fsSplatBase')
     this.historyClearPipeline = device.createRenderPipeline({
       label: 'sg-clear',
       layout: splatPipelineLayout,
@@ -348,7 +395,9 @@ export class Renderer {
       ],
     })
     const lifeDraw = (label: string, vs: string, fs: string) =>
-      scenePipeline(label, lifeDrawModule, vs, fs, this.lifeDrawLayout)
+      byBlend((blend) =>
+        scenePipeline(label, lifeDrawModule, vs, fs, this.lifeDrawLayout, LIFE_BLENDS[blend]),
+      )
     this.lifeDrawPipelines = {
       spectrum: lifeDraw('life-spectrum', 'vsPoint', 'fsPoint'),
       vector: lifeDraw('life-chroma', 'vsChroma', 'fsPoint'),
@@ -537,10 +586,10 @@ export class Renderer {
     // Intensity is the one alpha every base draw multiplies by, so fading the instrument out
     // from under the organism happens here rather than in four shaders.
     //
-    // The spectrogram is excluded, and has to be: there the particles *are* the picture rather
-    // than a layer over it, so dimming its base would dim the life along with it. The other
-    // three panes each draw their own geometry and then the population on top, which is what
-    // makes an opacity between the two meaningful at all.
+    // The spectrogram is excluded here, and has to be: it is one textured quad carrying both
+    // the measurement and the population, so dimming it would dim the life along with it. That
+    // pane honours the same knob a layer down instead, by scaling what the measurement deposits
+    // into the history — see `fsSplatBase`.
     const fadeBase =
       frame.config.life.enabled && frame.particles && mode !== 'spectrogram'
         ? frame.config.life.baseOpacity
@@ -845,13 +894,18 @@ export class Renderer {
     // instances and three million.
     const segments = kind === 'wave' ? 96 : 1
     const traces = kind === 'wave' ? Math.min(count, cfg.life.traces) : count
+    // Each step of phosphor is another quad per particle. In the waveform that multiplies an
+    // already-multiplied instance count, so the trail is capped there — four sines beating
+    // against each other is the whole effect anyway, and forty is a frame-rate cliff.
+    const trail = Math.max(0, Math.round(cfg.life.trail))
+    const steps = kind === 'wave' ? Math.min(trail, 4) : trail
 
     const u = this.u32
     const f = this.f32
     u[0] = traces
     u[1] = segments
     u[2] = count
-    u[3] = 0
+    u[3] = steps
     if (kind === 'spectrum') {
       f[4] = cfg.spectrum.freqMin
       f[5] = Math.min(cfg.spectrum.freqMax, frame.nyquist)
@@ -869,7 +923,11 @@ export class Renderer {
     }
     f[10] = cfg.life.pointSize
     f[11] = cfg.life.brightness
-    this.device.queue.writeBuffer(this.lifeDrawParams[kind], 0, this.scratch, 0, 48)
+    f[12] = cfg.life.trailFade
+    f[13] = cfg.life.trailModulation
+    f[14] = cfg.life.vibrato
+    f[15] = cfg.life.saturation
+    this.device.queue.writeBuffer(this.lifeDrawParams[kind], 0, this.scratch, 0, 64)
 
     if (!this.lifeDrawBinds[kind]) {
       this.lifeDrawBinds[kind] = this.device.createBindGroup({
@@ -882,9 +940,9 @@ export class Renderer {
         ],
       })
     }
-    pass.setPipeline(this.lifeDrawPipelines[kind])
+    pass.setPipeline(this.lifeDrawPipelines[kind][cfg.life.blend])
     pass.setBindGroup(0, this.lifeDrawBinds[kind]!)
-    pass.draw(6, traces * segments)
+    pass.draw(6, traces * segments * (steps + 1))
   }
 
   /**
@@ -895,6 +953,28 @@ export class Renderer {
   private spectrogramMargin(cfg: Config): number {
     const shiftSamples = cfg.analysis.maxTimeShift * cfg.analysis.fftSize
     return Math.max(1, Math.min(64, Math.ceil(shiftSamples / Math.max(1, cfg.analysis.hop)) + 1))
+  }
+
+  /**
+   * How far the *display* lags the head, as opposed to how far ahead the clear runs.
+   *
+   * These were one number, and they are two things. The clear has to stay a full margin ahead
+   * because a reassigned point can still land in a column after the frame that produced it. The
+   * display only has to lag by as much as is still going to change — and once the organism is
+   * running, most of what is in those columns is particles, which are painted where they are now
+   * and are not going to be corrected. Holding the picture back for them means the live edge,
+   * the one place anything is actually happening, sits off the end of the pane where it cannot
+   * be seen. `lead` is how much of that lag to give back.
+   *
+   * The cost of giving all of it back is that the measurement underneath, which *is* still
+   * being corrected, visibly settles in the last few columns. That is a fair trade for being
+   * able to watch the edge, and it is a knob rather than a decision.
+   */
+  private presentMargin(frame: RenderFrame): number {
+    const margin = this.spectrogramMargin(frame.config)
+    if (!frame.particles || !frame.config.life.enabled) return margin
+    const lead = Math.max(0, Math.min(1, frame.config.life.lead))
+    return Math.max(0, Math.round(margin * (1 - lead)))
   }
 
   private recordSpectrogramHistory(encoder: GPUCommandEncoder, frame: RenderFrame): void {
@@ -938,8 +1018,21 @@ export class Renderer {
     // How many columns the head moved this frame: the living splat stretches its quad across
     // them so a trail is continuous rather than dotted at the display rate.
     f[14] = frame.stats.frames
-    f[15] = 0
-    this.device.queue.writeBuffer(this.splatParams, 0, this.scratch, 0, 64)
+    f[15] = cfg.life.pointSize
+    f[16] = cfg.life.brightness
+    f[17] = cfg.life.baseOpacity
+    // Amplitude lead, in columns, and the range it is measured over — the same floor and
+    // ceiling the pane is displayed with, so "loud" means what the picture says it means.
+    f[18] = cfg.life.amplitudeLead
+    f[19] = cfg.spectrogram.dbFloor
+    // The instrument's own ink, for the measurement drawn underneath the population. The
+    // secondary colour rather than the primary: it is the ground here, not the subject.
+    const [ir, ig, ib] = hexToLinearRgb(cfg.style.secondary)
+    f[20] = ir
+    f[21] = ig
+    f[22] = ib
+    f[23] = cfg.spectrogram.dbCeil
+    this.device.queue.writeBuffer(this.splatParams, 0, this.scratch, 0, 96)
 
     if (!this.splatBind) {
       this.splatBind = this.device.createBindGroup({
@@ -962,9 +1055,17 @@ export class Renderer {
       pass.draw(6, 2)
     }
     if (frame.particles && cfg.life.enabled) {
-      // The organism has taken over: what lands in the history is no longer this frame's
-      // measurement but whatever is currently alive, wherever it has migrated to.
-      pass.setPipeline(this.lifePipeline)
+      // Both, and the knob between them. The measurement goes down first as a monochrome ground
+      // — where the energy actually is — and the population goes over it in its own colours,
+      // wherever it has migrated to. Seeing the two at once is the only way to tell that a
+      // particle has left the track it was born on, which is the entire point of it moving.
+      const blend = cfg.life.blend
+      if (cfg.life.baseOpacity > 0 && frame.stats.pointCount > 0) {
+        pass.setPipeline(this.historyBasePipeline[blend])
+        pass.setBindGroup(0, this.splatBind)
+        pass.draw(6, frame.stats.pointCount)
+      }
+      pass.setPipeline(this.lifePipeline[blend])
       pass.setBindGroup(0, this.splatBind)
       pass.draw(6, frame.particleCount)
     } else {
@@ -981,11 +1082,11 @@ export class Renderer {
     const history = this.history
     if (!history) return
     const cfg = frame.config
-    const margin = this.spectrogramMargin(cfg)
+    const margin = this.presentMargin(frame)
     const visible = Math.max(
       16,
       Math.min(
-        this.historyColumns - margin - 2,
+        this.historyColumns - this.spectrogramMargin(cfg) - 2,
         Math.ceil((cfg.spectrogram.historySeconds * frame.stats.sampleRate) / cfg.analysis.hop),
       ),
     )
@@ -1002,7 +1103,7 @@ export class Renderer {
     f[7] = cfg.spectrogram.gain
     f[8] = cfg.spectrogram.normalise ? 1 : 0
     f[9] = frame.particles && cfg.life.enabled ? 1 : 0
-    f[10] = 0
+    f[10] = cfg.life.saturation
     f[11] = 0
     this.device.queue.writeBuffer(this.sgPresentParams, 0, this.scratch, 0, 48)
 

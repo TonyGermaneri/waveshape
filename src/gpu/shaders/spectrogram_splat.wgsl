@@ -21,11 +21,17 @@ struct Params {
   b: vec4<f32>,
   // x: splatRadius px   y: gain   z: clear range 0 start   w: clear range 0 count
   c: vec4<f32>,
-  // x: clear range 1 start   y: clear range 1 count   z: columns advanced this frame   w: unused
+  // x: clear range 1 start   y: clear range 1 count   z: columns advanced this frame
+  // w: life point size px
   // Two ranges rather than two draws: the clear span can wrap around the end of the ring, and
   // queue.writeBuffer is ordered ahead of the entire command buffer, so re-writing the uniform
   // between two draws in the same pass would give both draws the second value.
   d: vec4<f32>,
+  // x: life brightness   y: base opacity   z: amplitude lead in columns   w: dbFloor
+  e: vec4<f32>,
+  // xyz: the ink the underlying measurement is drawn in when the organism is present
+  // w: dbCeil
+  f: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -124,6 +130,28 @@ fn fsSplat(in: VSOut) -> @location(0) vec4<f32> {
   return vec4<f32>(in.energy * k * norm, k * norm, 0.0, 0.0);
 }
 
+// The same measurement, written in the encoding the living present pass reads.
+//
+// The history texture holds one of two things depending on whether the organism is running. Dead,
+// it is (energy, coverage) in the red and green channels and the palette colours it at present
+// time. Alive, it is (tint × energy, energy) — the particles brought their own colours and a
+// palette would throw the harmonic identity in them away.
+//
+// Those two encodings cannot share a texture, which is why turning the organism on used to
+// replace the spectrogram outright and why `baseOpacity` did nothing in this pane. Writing the
+// underlying measurement in the *living* encoding, in the instrument's own ink, lets both be
+// present at once: the reassigned energy reads as a monochrome ground and the population reads
+// as colour over it, and the knob between them means what it means everywhere else.
+@fragment
+fn fsSplatBase(in: VSOut) -> @location(0) vec4<f32> {
+  let r = max(P.c.x, 0.5);
+  let d2 = dot(in.offset, in.offset) / (r * r);
+  let k = exp(-3.5 * d2);
+  let norm = 1.0 / (1.12 * r * r);
+  let e = in.energy * k * norm * P.e.y;
+  return vec4<f32>(P.f.rgb * e, e);
+}
+
 // ---------------------------------------------------------------------------------------
 // Living particles
 // ---------------------------------------------------------------------------------------
@@ -155,14 +183,32 @@ fn vsLife(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) ->
   let rows = f32(P.a.z);
   let advanced = max(P.d.z, 1.0);
 
-  let colOffset = q.time / max(P.b.x, 1.0);
+  // Where along the time axis this particle lays itself down.
+  //
+  // The base is the write head, as it must be — a particle is painted where it is *now*, and
+  // the column being written now is the column it goes in. What moves it off that is its own
+  // amplitude: a full-scale particle lands on the head, and a quiet one hangs back by up to the
+  // amplitude lead. The leading edge stops being a ruled vertical line and becomes a contour of
+  // how loud the frame is at each frequency — a picture of the present rather than a cut
+  // through it.
+  //
+  // Hanging back rather than reaching forward, and the direction is not arbitrary. The display
+  // shows nothing past the head, so a particle written ahead of it is written off the end of
+  // the pane and only appears once the head catches up — which would hide exactly the loud
+  // partials the contour exists to show. Everything stays inside the window this way, and the
+  // loudest thing in the frame is what touches the edge.
+  let db = 10.0 * log2(max(q.energy * q.energy, 1e-20)) * 0.30102999566;
+  let loudness = clamp((db - P.e.w) / max(P.f.w - P.e.w, 1e-6), 0.0, 1.0);
+  let colOffset = q.time / max(P.b.x, 1.0) - (1.0 - loudness) * P.e.z;
   var colF = f32(P.a.w) + colOffset - advanced * 0.5;
   colF = colF - floor(colF / cols) * cols;
 
   let rowF = freqAxis(q.freq) * rows;
 
   let c = corner(vi);
-  let r = max(P.c.x, 0.5);
+  // The organism's own size, not the analyser's splat radius. Point size means the same thing
+  // in all four scopes: how big a particle draws.
+  let r = max(P.d.w, 0.5);
   let px = colF + 0.5 + c.x * (r + advanced * 0.5);
   let py = rowF + 0.5 + c.y * r;
 
@@ -178,13 +224,13 @@ fn vsLife(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) ->
   // Vitality lives in bits 16..21 of life1, and is what makes a dying particle fade rather than
   // vanish between one frame and the next.
   let vitality = f32((q.life1 >> 16u) & 63u) / 63.0;
-  out.energy = q.energy * q.energy * vitality * P.c.y;
+  out.energy = q.energy * q.energy * vitality * P.c.y * P.e.x;
   return out;
 }
 
 @fragment
 fn fsLife(in: LifeOut) -> @location(0) vec4<f32> {
-  let r = max(P.c.x, 0.5);
+  let r = max(P.d.w, 0.5);
   let d2 = dot(in.offset, in.offset) / (r * r);
   let k = exp(-3.5 * d2);
   let norm = 1.0 / (1.12 * r);
