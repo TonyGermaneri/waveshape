@@ -10,7 +10,7 @@
 
 import { DEFAULT_CONFIG, FFT_SIZES, SAMPLE_RATES, type Config } from '../config.ts'
 import { WINDOWS, windowSpec } from '../dsp/windows.ts'
-import { PALETTES } from '../gpu/colormap.ts'
+import { PALETTES, WHEELS } from '../gpu/colormap.ts'
 import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
 import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
@@ -1638,6 +1638,23 @@ export class Overlay {
       {
         kind: 'note',
         text: 'One organism, four windows onto it, and these three settings mean the same thing in all four. The spectrogram shows where the particles have been, over the reassigned energy they left. The spectrum shows each at its own frequency and level — the domain it was born in. The vectorscope arranges them by pitch class around a circle, so every octave of a note lies on one spoke and a chord is a constellation. The waveform draws each living partial as the sine it claims to be: not a reconstruction, since the organism never measured phase and is not entitled to one, but its own account of what it is hearing.',
+      },
+      {
+        kind: 'select',
+        label: 'Pitch-class wheel',
+        options: WHEELS.map((wheel) => ({
+          value: wheel.id,
+          // The spread is the whole argument for having alternatives, so it is on the option
+          // rather than buried in the hint: a wheel whose lightness swings makes some notes look
+          // louder than others, and you should be able to see that while choosing one.
+          label: `${wheel.label} · ${wheel.spread < 1.05 ? 'flat' : `${wheel.spread.toFixed(1)}×`}`,
+        })),
+        get: () => l.wheel,
+        set: (v) => {
+          l.wheel = v
+        },
+        disabled: () => !l.enabled,
+        hint: 'Colour comes from where a particle sits inside the octave, so every octave of a note is one colour and a harmonic series fans out into a fixed figure. That makes it a wheel rather than a ramp — it has to close on itself — and the organism has always closed it with an HSL hue sweep, which is the same mistake as a rainbow palette wearing a different hat: hue at full saturation swings its own lightness by 12.8 times across the twelve semitones, so a note at E looks louder than the same note at A flat. The figure next to each name is that wheel’s own lightness spread across its stops, brightest pitch class over dimmest. The flat ones are built in OKLCh, where lightness holds while hue goes round; the wide ones are looks, and Ember, Ice and Dusk are meant to be. Every one of them closes without a seam and gives each of the twelve pitch classes a colour of its own. One organism, so this is its colour in all four panes, and changing it repaints the whole population on the next frame.',
       },
       num('Point size', 'pointSize', 0.5, 24, 0.1, (v) => `${v.toFixed(1)} px`, 'How big a particle draws: its splat radius in the spectrogram, its point radius in the spectrum and the vectorscope, the width of its sine in the waveform.'),
       num('Brightness', 'brightness', 0, 8, 0.05, fmt.fixed(2)),

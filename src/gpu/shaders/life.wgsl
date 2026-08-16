@@ -59,7 +59,7 @@ struct Params {
   // x: feed rate   y: occupancy a frequency may hold before births are suppressed
   // z: roam   w: vibrato cents
   h: vec4<f32>,
-  // x: stamina (steps unfed)   y: dissonance   z: surface pull   w: unused
+  // x: stamina (steps unfed)   y: dissonance   z: surface pull   w: wheel turns per octave
   i: vec4<f32>,
 }
 
@@ -83,6 +83,17 @@ struct Census {
 @group(0) @binding(6) var<storage, read> spectrum: array<f32>;
 @group(0) @binding(7) var<storage, read_write> allocator: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> fieldOut: array<f32>;
+/**
+ * The pitch-class wheel, rasterised to 256 entries. See gpu/colormap.ts.
+ *
+ * Uniform rather than storage, and not for style. The other eight bindings here are already
+ * storage buffers, and a device is only required to offer eight per stage — this one would be
+ * the ninth, and the whole pass fails to build. The adapter this was written on would have
+ * granted ten had they been asked for, which is exactly the trap: raising the requested limit
+ * fixes it here and breaks it on hardware that only meets the floor. Four kilobytes of
+ * read-only lookup is what a uniform buffer is for, and eleven of the twelve slots are free.
+ */
+@group(0) @binding(9) var<uniform> wheel: array<vec4<f32>, 256>;
 
 const FLAG_ALIVE: u32 = 1u;
 const FLAG_HARMONIC: u32 = 2u;
@@ -169,15 +180,42 @@ fn unpackRgb(word: u32) -> vec3<f32> {
 
 fn colourFlags(word: u32) -> u32 { return (word >> 24u) & 255u; }
 
-fn hslToRgb(h: f32, s: f32, l: f32) -> vec3<f32> {
-  let a = s * min(l, 1.0 - l);
-  var out = vec3<f32>(0.0);
-  for (var i = 0u; i < 3u; i = i + 1u) {
-    let n = array<f32, 3>(0.0, 8.0, 4.0)[i];
-    let k = (n + h * 12.0) % 12.0;
-    out[i] = l - a * max(-1.0, min(min(k - 3.0, 9.0 - k), 1.0));
-  }
-  return out;
+// ---------------------------------------------------------------------------------------
+// Colour: where a particle sits in the octave, through the wheel
+// ---------------------------------------------------------------------------------------
+
+/// Position in the octave, measured from C, in turns of the wheel.
+///
+/// One turn per octave is the chromatic ordering. Seven turns walks the circle of fifths
+/// instead: a fifth becomes a small step in hue rather than most of the way round, so notes
+/// that agree look like they agree. Seven and twelve share no factor, so every pitch class
+/// still keeps a colour of its own.
+fn wheelPhase(freq: f32) -> f32 {
+  return fract(log2(max(freq, 1.0) / 16.3516) * P.i.w);
+}
+
+fn wheelAt(phase: f32) -> vec3<f32> {
+  let t = fract(phase) * 256.0;
+  let i0 = u32(t) % 256u;
+  // Wrapping rather than clamping at the top: the wheel closes, and pinning the last entry
+  // would put a flat spot of one two-hundred-and-fifty-sixth of an octave at B.
+  let i1 = (i0 + 1u) % 256u;
+  return mix(wheel[i0].rgb, wheel[i1].rgb, fract(t));
+}
+
+/// The colour a particle should be right now, given where it is and what it has turned out to
+/// be. Saturation is how sure the organism is that this is a note at all; brightness leans on
+/// which harmonic it is, so a fundamental reads stronger than its own twentieth partial.
+fn particleColour(freq: f32, harmonic: u32, support: f32, flatness: f32) -> vec3<f32> {
+  let base = wheelAt(wheelPhase(freq));
+  let supportF = min(1.0, support / 8.0);
+  let saturation = clamp((1.0 - flatness) * (0.35 + 0.65 * supportF), 0.0, 1.0);
+  var depth = 0.5;
+  if (harmonic > 0u) { depth = 1.0 / sqrt(f32(harmonic)); }
+  // Desaturating toward the wheel entry's own grey rather than toward a fixed one, so a washed
+  // out particle stays in the family it came from instead of sliding to neutral.
+  let grey = dot(base, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(grey), base, saturation) * (0.62 + 0.66 * depth);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -525,14 +563,7 @@ fn birth(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (onset > 0.4) { flags = flags | FLAG_ONSET; }
   if (flatness > 0.5) { flags = flags | FLAG_NOISE; }
 
-  // Chroma: position within the octave, so every octave of a note is one colour and a harmonic
-  // series reads as a repeating sequence instead of a ramp.
-  let chroma = fract(log2(max(freq, 1.0) / 16.3516));
-  let supportF = min(1.0, f32(support) / 8.0);
-  let saturation = clamp((1.0 - flatness) * (0.35 + 0.65 * supportF), 0.0, 1.0);
-  var depth = 0.5;
-  if (harmonic > 0u) { depth = 1.0 / sqrt(f32(harmonic)); }
-  let rgb = hslToRgb(chroma, saturation, 0.35 + 0.45 * depth);
+  let rgb = particleColour(freq, harmonic, f32(support), flatness);
 
   // Ring allocation, wrapping at the population cap rather than at the pool size. Because
   // slots are handed out in birth order, the slot the ring comes back to always holds the
@@ -805,6 +836,22 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   // hundred steps a particle actually lives.
   let dither = fract(character + f32(P.a.w) * 0.6180339887);
   q.life1 = packLife1(nextAge, vitality, lifeCohort(q.life1), lifeGeneration(q.life1), dither);
+  // ---- colour ----------------------------------------------------------------------
+  //
+  // Recomputed every step rather than kept from birth, for two reasons.
+  //
+  // A particle roams, and the vectorscope has always placed it by the pitch class it is at now.
+  // Holding the birth colour meant the hue and the position disagreed the moment anything moved
+  // — a particle drawn at F wearing the colour of the C it was born on. Now a particle walking
+  // its own series sweeps the wheel as it goes, and all four panes agree about what it is.
+  //
+  // It also means changing the wheel repaints the whole population on the next frame instead of
+  // waiting for the cast to turn over, which for long-lived residents is a wait with no end.
+  //
+  // Only the low twenty-four bits: the top byte is flags and does not belong to the colour.
+  let tint = particleColour(q.freq, harmonic, support, flatness);
+  q.colour = (q.colour & 0xff000000u) | (packColour(tint, 0u) & 0x00ffffffu);
+
   // Being fed is worth recording: the draw passes use it, and it is the difference between a
   // particle that is sustaining a partial and one that is on its way out.
   if (fed) {

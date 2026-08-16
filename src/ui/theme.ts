@@ -4,7 +4,7 @@
  * A theme is a complete look, not a colour pair: the four canvas colours, the whole post
  * chain (persistence, bloom, tone curve, exposure, gamma, saturation, vignette), the graticule,
  * the spectrogram colour map, and the overlay's own chrome. Applying one therefore writes into
- * three places — `config.style`, `config.spectrogram.palette` and `config.ui` — and the panel
+ * four places — `config.style`, `config.spectrogram.palette`, `config.life.wheel` and `config.ui` — and the panel
  * restyles itself along with the trace.
  *
  * Built-ins are declared as partials over the default style so a new style key picks up a
@@ -22,8 +22,13 @@ export interface Theme {
   /** Built-ins cannot be overwritten or deleted from the panel. */
   builtin: boolean
   style: Config['style']
-  /** Spectrogram colour map id. */
+  /** Spectrogram colour map id: level to colour. */
   palette: string
+  /**
+   * Pitch-class wheel id: where a particle sits in the octave, to colour. The organism's, so it
+   * applies in all four panes rather than only the spectrogram.
+   */
+  wheel: string
   ui: UiTheme
 }
 
@@ -31,6 +36,8 @@ interface ThemeSpec {
   id: string
   label: string
   palette: string
+  /** Omitted where the theme has no opinion, which leaves the even wheel in place. */
+  wheel?: string
   style: Partial<Config['style']>
   ui: Partial<UiTheme>
 }
@@ -41,6 +48,7 @@ function builtin(spec: ThemeSpec): Theme {
     label: spec.label,
     builtin: true,
     palette: spec.palette,
+    wheel: spec.wheel ?? DEFAULT_CONFIG.life.wheel,
     style: { ...DEFAULT_CONFIG.style, ...spec.style },
     ui: { ...DEFAULT_CONFIG.ui, ...spec.ui },
   }
@@ -69,6 +77,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'phosphor',
     label: 'Phosphor CRT',
     palette: 'phosphor',
+    wheel: 'ash',
     style: {
       background: '#00120a',
       primary: '#7dff9b',
@@ -87,6 +96,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'amber',
     label: 'Amber CRT',
     palette: 'ember',
+    wheel: 'ember',
     style: {
       background: '#120800',
       primary: '#ffb247',
@@ -105,6 +115,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'ice',
     label: 'Ice',
     palette: 'ice',
+    wheel: 'ice',
     style: {
       background: '#01060e',
       primary: '#9fe8ff',
@@ -122,6 +133,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'paper',
     label: 'Paper',
     palette: 'mono',
+    wheel: 'tide',
     style: {
       background: '#f4f2ee',
       primary: '#101014',
@@ -141,6 +153,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'ink',
     label: 'Ink',
     palette: 'mono',
+    wheel: 'tide',
     style: {
       background: '#ffffff',
       primary: '#000000',
@@ -160,6 +173,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'solarized',
     label: 'Solarized',
     palette: 'viridis',
+    wheel: 'tide',
     style: {
       background: '#fdf6e3',
       primary: '#073642',
@@ -178,6 +192,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'blueprint',
     label: 'Blueprint',
     palette: 'ice',
+    wheel: 'ice',
     style: {
       background: '#06213f',
       primary: '#dfeeff',
@@ -196,6 +211,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'nord',
     label: 'Nord',
     palette: 'viridis',
+    wheel: 'dusk',
     style: {
       background: '#2e3440',
       primary: '#eceff4',
@@ -213,6 +229,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'noir',
     label: 'Noir',
     palette: 'mono',
+    wheel: 'ash',
     style: {
       background: '#0b0b0d',
       primary: '#d9d9d9',
@@ -232,6 +249,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'matrix',
     label: 'Matrix',
     palette: 'phosphor',
+    wheel: 'ash',
     style: {
       background: '#000700',
       primary: '#38ff6a',
@@ -251,6 +269,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'ultraviolet',
     label: 'Ultraviolet',
     palette: 'plasma',
+    wheel: 'neon',
     style: {
       background: '#0a0413',
       primary: '#e6c8ff',
@@ -270,6 +289,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'vapor',
     label: 'Vaporwave',
     palette: 'plasma',
+    wheel: 'neon',
     style: {
       background: '#12002b',
       primary: '#ff6ec7',
@@ -291,6 +311,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'infrared',
     label: 'Infrared',
     palette: 'inferno',
+    wheel: 'ember',
     style: {
       background: '#0b0000',
       primary: '#ff5a4d',
@@ -309,6 +330,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'sunset',
     label: 'Sunset',
     palette: 'magma',
+    wheel: 'dusk',
     style: {
       background: '#16060f',
       primary: '#ffb37b',
@@ -328,6 +350,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'aurora',
     label: 'Aurora',
     palette: 'viridis',
+    wheel: 'phase',
     style: {
       background: '#01110f',
       primary: '#7ef9d0',
@@ -346,6 +369,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'turbojet',
     label: 'Turbo',
     palette: 'turbo',
+    wheel: 'vivid',
     style: {
       background: '#04060a',
       primary: '#f2f6ff',
@@ -363,6 +387,7 @@ export const BUILTIN_THEMES: readonly Theme[] = [
     id: 'contrast',
     label: 'High contrast',
     palette: 'turbo',
+    wheel: 'chromatic',
     style: {
       background: '#000000',
       primary: '#ffff00',
@@ -413,6 +438,7 @@ export function normaliseTheme(theme: Theme): Theme {
     label: theme.label,
     builtin: false,
     palette: theme.palette,
+    wheel: theme.wheel ?? DEFAULT_CONFIG.life.wheel,
     style: { ...DEFAULT_CONFIG.style, ...theme.style },
     ui: { ...DEFAULT_CONFIG.ui, ...theme.ui },
   }
@@ -454,6 +480,7 @@ export function themeFromConfig(config: Config, label: string): Theme {
     label,
     builtin: false,
     palette: config.spectrogram.palette,
+    wheel: config.life.wheel,
     style: structuredClone(config.style),
     ui: structuredClone(config.ui),
   }
@@ -463,12 +490,16 @@ export function applyTheme(config: Config, theme: Theme): void {
   Object.assign(config.style, theme.style)
   Object.assign(config.ui, theme.ui)
   config.spectrogram.palette = theme.palette
+  // The organism's wheel is part of the look too, but only the look — nothing about how the
+  // population behaves belongs to a theme.
+  config.life.wheel = theme.wheel
   config.themeId = theme.id
 }
 
 /** True when the live config still matches the theme it claims — i.e. nothing was hand-edited. */
 export function themeMatchesConfig(config: Config, theme: Theme): boolean {
   if (config.spectrogram.palette !== theme.palette) return false
+  if (config.life.wheel !== theme.wheel) return false
   const same = (a: Record<string, unknown>, b: Record<string, unknown>) =>
     Object.keys(b).every((k) => a[k] === b[k])
   return (

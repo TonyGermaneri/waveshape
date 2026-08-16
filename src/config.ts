@@ -220,6 +220,12 @@ export interface Config {
     /** How brightly the population is drawn, in all four scopes. */
     brightness: number
     /**
+     * Which pitch-class wheel colours the population — id from `gpu/colormap.ts`. Cyclic, not a
+     * ramp: it maps where a particle sits inside the octave, so every octave of a note is one
+     * colour. One organism, so one wheel across all four scopes.
+     */
+    wheel: string
+    /**
      * How the population merges with whatever is already on the target. Additive is the house
      * style and bleaches when the crowd is dense; screen rolls off toward white instead of
      * through it; lighten keeps the brighter of the two and never mixes hues at all.
@@ -418,6 +424,7 @@ export const DEFAULT_CONFIG: Config = {
     peakFloorDb: -75,
     pointSize: 1.6,
     brightness: 0.8,
+    wheel: 'even',
     blend: 'screen',
     saturation: 1.4,
     trail: 6,

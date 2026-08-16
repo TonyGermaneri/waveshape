@@ -19,6 +19,7 @@
 
 import type { Config } from '../config.ts'
 import { PARTICLE_BYTES } from './particle.ts'
+import { rasteriseWheel, wheelById } from './colormap.ts'
 import type { Analyzer } from './analyzer.ts'
 
 import lifeWgsl from './shaders/life.wgsl?raw'
@@ -31,6 +32,9 @@ export const FIELD_OCTAVES = 10
 
 /** 32 bytes each; 256k of them is 8 MB, and a busy frame births a few thousand. */
 export const PARTICLE_CAPACITY = 1 << 18
+
+/** Entries in the rasterised pitch-class wheel. A shade over twenty per semitone. */
+const WHEEL_ENTRIES = 256
 
 const CENSUS_BYTES = 16 + 32 * 8
 /** Nine vec4s. Kept in step with `Params` in life.wgsl. */
@@ -58,6 +62,9 @@ export class Life {
   private readonly deposit: GPUBuffer
   private readonly census: GPUBuffer
   private readonly params: GPUBuffer
+  private readonly wheel: GPUBuffer
+  /** Which wheel is currently uploaded, so it is rasterised on change rather than every frame. */
+  private wheelId = ''
 
   private readonly surveyPipeline: GPUComputePipeline
   private readonly birthPipeline: GPUComputePipeline
@@ -90,6 +97,13 @@ export class Life {
     this.deposit = mk('deposit', FIELD_BINS * 4)
     this.census = mk('census', CENSUS_BYTES)
     this.allocator = mk('allocator', 16)
+    // Uniform, not storage: the pass already holds the eight storage buffers a device is
+    // required to offer, and this would have been the ninth. See the binding in life.wgsl.
+    this.wheel = device.createBuffer({
+      label: 'life-wheel',
+      size: WHEEL_ENTRIES * 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
     this.params = device.createBuffer({
       label: 'life-params',
       size: PARAM_BYTES,
@@ -114,6 +128,7 @@ export class Life {
         entry(6, 'read-only-storage'),
         entry(7, 'storage'),
         entry(8, 'storage'),
+        entry(9, 'uniform'),
       ],
     })
 
@@ -185,6 +200,7 @@ export class Life {
           { binding: 6, resource: { buffer: this.analyzer.spectrumBuf } },
           { binding: 7, resource: { buffer: this.allocator } },
           { binding: 8, resource: { buffer: write } },
+          { binding: 9, resource: { buffer: this.wheel } },
         ],
       })
     this.binds = [
@@ -239,8 +255,17 @@ export class Life {
     f[32] = life.stamina
     f[33] = life.dissonance
     f[34] = life.surfacePull
-    f[35] = 0
+    const wheel = wheelById(life.wheel)
+    f[35] = wheel.turns ?? 1
     this.device.queue.writeBuffer(this.params, 0, this.scratch, 0, PARAM_BYTES)
+
+    // Rasterised on change rather than every frame. Two wheels can share stops and differ only
+    // in how many turns they take — the circle of fifths is the even wheel walked sevenfold —
+    // so the id is what decides, not the stops.
+    if (this.wheelId !== wheel.id) {
+      this.device.queue.writeBuffer(this.wheel, 0, rasteriseWheel(wheel.stops, WHEEL_ENTRIES))
+      this.wheelId = wheel.id
+    }
 
     const [a, b] = this.ensureBinds()
     const bind = this.parity === 0 ? a : b
