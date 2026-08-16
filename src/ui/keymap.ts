@@ -20,7 +20,7 @@ import { fmt } from './widgets.ts'
 
 export const KEY_GROUPS = [
   'Panel',
-  'Modes',
+  'Focus',
   'Analysis',
   'Display',
   'Appearance',
@@ -295,15 +295,17 @@ export const BINDINGS: readonly Binding[] = [
     run: (ctx, arg) => `Tab  ${ctx.actions.cycleTab(arg)}`,
   },
 
-  // ------------------------------------------------------------------------------ modes
+  // ------------------------------------------------------------------------------ focus
   {
     keys: MODES.map((_, i) => ({ token: String(i + 1), arg: i })),
-    label: 'Waveform · Spectrum · Spectrogram · Vectorscope',
-    group: 'Modes',
+    label: 'Focus waveform · spectrum · spectrogram · vectorscope',
+    group: 'Focus',
+    detail:
+      'All four panes are on screen at once, so this aims the contextual keys below rather than switching anything. The focused pane is the one whose name is highlighted.',
     structural: true,
     run: (ctx, arg) => {
       ctx.config.mode = MODES[arg]
-      return MODE_LABELS[MODES[arg]]
+      return `Focus  ${MODE_LABELS[MODES[arg]]}`
     },
   },
 

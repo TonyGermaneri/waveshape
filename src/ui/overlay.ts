@@ -15,6 +15,7 @@ import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
 import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
+import { PANE_SPECS, clampSplit, type Pane } from './layout.ts'
 import { fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
 import { KeyHelp } from './help.ts'
@@ -33,12 +34,14 @@ import {
   type Theme,
 } from './theme.ts'
 
-const MODES: { id: Mode; label: string; key: string }[] = [
-  { id: 'wave', label: 'Waveform', key: '1' },
-  { id: 'spectrum', label: 'Spectrum', key: '2' },
-  { id: 'spectrogram', label: 'Spectrogram', key: '3' },
-  { id: 'vector', label: 'Vectorscope', key: '4' },
-]
+// Drawn rather than typed: ▶ and ❚❚ are rendered by a different font on every platform and
+// sit on a different baseline in each of them.
+const PLAY_ICON =
+  '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M3.2 2.1 9.6 6 3.2 9.9z"/></svg>'
+const RESET_ICON =
+  '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M6 1.6a4.4 4.4 0 1 0 4.29 3.44l-1.27.28A3.1 3.1 0 1 1 6 2.9z"/><path d="M5.1 0.6 7.4 2.2 5.1 3.8z"/></svg>'
+const STOP_ICON =
+  '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><rect x="3" y="2.4" width="2.4" height="7.2" rx="0.5"/><rect x="6.6" y="2.4" width="2.4" height="7.2" rx="0.5"/></svg>'
 
 const TABS = [
   'Source',
@@ -87,13 +90,20 @@ export class Overlay {
   private readonly panel: HTMLElement
   private readonly body: HTMLElement
   private readonly tabBar: HTMLElement
-  private readonly modeBar: HTMLElement
   private readonly readout: HTMLElement
   private readonly labelLayer: HTMLElement
+  private readonly splitLayer: HTMLElement
+  private readonly splitHandle: HTMLElement
+  private readonly splitLineX: HTMLElement
+  private readonly splitLineY: HTMLElement
+  private readonly paneLabels: HTMLElement[] = []
   private readonly toast: HTMLElement
 
   private readonly help: KeyHelp
   private readonly fullscreenButton: HTMLButtonElement
+  private readonly playButton: HTMLButtonElement
+  private readonly stopButton: HTMLButtonElement
+  private transportState = ''
 
   private tab: Tab = 'Source'
   private refreshControls: () => void = () => {}
@@ -119,8 +129,14 @@ export class Overlay {
     this.labelLayer = document.createElement('div')
     this.labelLayer.className = 'ws-labels'
 
-    this.modeBar = document.createElement('div')
-    this.modeBar.className = 'ws-modes'
+    this.splitLayer = document.createElement('div')
+    this.splitLayer.className = 'ws-split'
+    this.splitLineX = document.createElement('div')
+    this.splitLineX.className = 'ws-split-line ws-split-line-x'
+    this.splitLineY = document.createElement('div')
+    this.splitLineY.className = 'ws-split-line ws-split-line-y'
+    this.splitHandle = this.buildSplitHandle()
+    this.splitLayer.append(this.splitLineX, this.splitLineY, this.splitHandle)
 
     this.tabBar = document.createElement('div')
     this.tabBar.className = 'ws-tabs'
@@ -150,15 +166,40 @@ export class Overlay {
       button.addEventListener('click', onClick)
       return button
     }
+    const transport = (icon: string, label: string, onClick: () => void) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'ws-close ws-transport'
+      button.innerHTML = icon
+      button.title = label
+      button.setAttribute('aria-label', label)
+      button.addEventListener('click', onClick)
+      return button
+    }
+    // Transport sits at the head of the group: it is the only control here that touches the
+    // signal rather than the view.
+    this.playButton = transport(PLAY_ICON, 'Start capture (r)', () => this.deps.onRestartSource())
+    this.stopButton = transport(STOP_ICON, 'Stop capture (shift R)', () => this.deps.onStopSource())
+    const resetButton = transport(RESET_ICON, 'Reset the pane layout to four equal quarters', () =>
+      this.resetSplit(),
+    )
     this.fullscreenButton = chip('⤢  f', 'Full screen (f)', () => void this.toggleFullscreen())
+
+    const divider = document.createElement('span')
+    divider.className = 'ws-header-divider'
+
     actions.append(
+      this.playButton,
+      this.stopButton,
+      resetButton,
+      divider,
       chip('⌨  ?', 'Keyboard reference (?)', () => this.toggleHelp()),
       this.fullscreenButton,
       chip('Hide  ·  esc', 'Hide the control panel (esc)', () => this.setVisible(false)),
     )
     header.append(title, actions)
 
-    this.panel.append(header, this.modeBar, this.tabBar, this.body)
+    this.panel.append(header, this.tabBar, this.body)
 
     this.readout = document.createElement('div')
     this.readout.className = 'ws-readout'
@@ -166,7 +207,7 @@ export class Overlay {
     this.toast = document.createElement('div')
     this.toast.className = 'ws-toast'
 
-    this.root.append(this.labelLayer, this.panel, this.readout, this.toast)
+    this.root.append(this.labelLayer, this.splitLayer, this.panel, this.readout, this.toast)
 
     this.syncChrome()
     onFullscreenChange(() => {
@@ -175,7 +216,6 @@ export class Overlay {
     })
     this.syncFullscreenButton()
 
-    this.buildModeBar()
     this.buildTabBar()
     this.rebuild()
   }
@@ -272,6 +312,26 @@ export class Overlay {
     applyUiTheme(config.ui, config.style)
   }
 
+  /**
+   * Keeps the transport in step with the engine. Called every frame, so it compares a small
+   * state key first: writing the same attributes sixty times a second would be free in effect
+   * and not free in style recalculation.
+   */
+  private syncTransport(engine: EngineStatus): void {
+    const key = `${engine.running}|${engine.suspended}`
+    if (key === this.transportState) return
+    this.transportState = key
+    this.playButton.classList.toggle('ws-active', engine.running && !engine.suspended)
+    this.playButton.classList.toggle('ws-pending', engine.running && engine.suspended)
+    this.playButton.title = engine.suspended
+      ? 'Audio is held by autoplay policy — click to let it through'
+      : engine.running
+        ? 'Restart capture (r)'
+        : 'Start capture (r)'
+    this.playButton.setAttribute('aria-label', this.playButton.title)
+    this.stopButton.disabled = !engine.running
+  }
+
   private syncFullscreenButton(): void {
     const on = isFullscreen()
     this.fullscreenButton.textContent = on ? '⤡  f' : '⤢  f'
@@ -287,32 +347,6 @@ export class Overlay {
   setSelfTestResult(text: string): void {
     this.selfTestResult = text
     if (this.tab === 'System') this.rebuild()
-  }
-
-  private buildModeBar(): void {
-    this.modeBar.replaceChildren()
-    for (const mode of MODES) {
-      const button = document.createElement('button')
-      button.type = 'button'
-      button.className = 'ws-mode'
-      button.dataset.mode = mode.id
-      button.innerHTML = `${mode.label}<kbd>${mode.key}</kbd>`
-      button.addEventListener('click', () => {
-        this.deps.config.mode = mode.id
-        this.deps.onChange()
-        this.syncModeBar()
-        this.rebuild()
-      })
-      this.modeBar.append(button)
-    }
-    this.syncModeBar()
-  }
-
-  private syncModeBar(): void {
-    for (const child of Array.from(this.modeBar.children)) {
-      const button = child as HTMLElement
-      button.classList.toggle('ws-active', button.dataset.mode === this.deps.config.mode)
-    }
   }
 
   private buildTabBar(): void {
@@ -344,12 +378,10 @@ export class Overlay {
 
   /** Rebuilds the active tab's controls. Called on tab change and on structural config change. */
   rebuild(): void {
-    this.syncModeBar()
     const scroll = this.body.scrollTop
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
       this.syncChrome()
       this.deps.onChange()
-      this.syncModeBar()
       if (structural) {
         // A discrete choice can change which controls exist — switching the source from a
         // device to the generator adds a whole block of settings — so the panel is rebuilt
@@ -365,6 +397,7 @@ export class Overlay {
   /** Cheap per-frame update of live values without rebuilding DOM. */
   update(): void {
     const s = this.deps.status()
+    this.syncTransport(s.engine)
     if (this.deps.config.style.showReadout) {
       this.readout.classList.remove('ws-hidden')
       this.readout.replaceChildren(...this.readoutItems(s))
@@ -377,7 +410,12 @@ export class Overlay {
   private readoutItems(s: OverlayStatus): HTMLElement[] {
     const items: [string, string][] = []
     const e = s.engine
-    items.push(['src', e.running ? e.sourceLabel.slice(0, 28) : 'stopped'])
+    const source = !e.running
+      ? e.sourceLabel.slice(0, 28)
+      : e.suspended
+        ? 'held — click to start audio'
+        : e.sourceLabel.slice(0, 28)
+    items.push(['src', source])
     items.push(['rate', e.sampleRate ? `${(e.sampleRate / 1000).toFixed(1)} kHz` : '—'])
     items.push(['fft', `${this.deps.config.analysis.fftSize}`])
     items.push(['Δf', `${s.binHz.toFixed(2)} Hz`])
@@ -408,35 +446,162 @@ export class Overlay {
     })
   }
 
-  /** Positions the axis tick labels over the canvas. */
-  setTicks(ticks: AxisTick[], width: number, height: number): void {
-    while (this.labelPool.length < ticks.length) {
-      const node = document.createElement('span')
+  // -------------------------------------------------------------------------------------
+  // Quad layout
+  // -------------------------------------------------------------------------------------
+
+  private buildSplitHandle(): HTMLElement {
+    const handle = document.createElement('button')
+    handle.type = 'button'
+    handle.className = 'ws-grab'
+    handle.title = 'Drag to resize the four panes. Push it to an edge to close two of them.'
+    handle.setAttribute('aria-label', 'Resize panes')
+    handle.innerHTML =
+      '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="1.6"/><path d="M8 1.4 6.2 4h3.6zM8 14.6 6.2 12h3.6zM1.4 8 4 6.2v3.6zM14.6 8 12 6.2v3.6z"/></svg>'
+
+    let dragging = false
+    handle.addEventListener('pointerdown', (event) => {
+      dragging = true
+      handle.setPointerCapture(event.pointerId)
+      handle.classList.add('ws-grabbing')
+      event.preventDefault()
+    })
+    handle.addEventListener('pointermove', (event) => {
+      if (!dragging) return
+      // Measured against the layer rather than the handle: the handle moves under the pointer,
+      // so anything relative to it would drift by its own displacement each frame.
+      const box = this.splitLayer.getBoundingClientRect()
+      this.setSplit(
+        (event.clientX - box.left) / Math.max(1, box.width),
+        (event.clientY - box.top) / Math.max(1, box.height),
+      )
+    })
+    const release = (event: PointerEvent) => {
+      if (!dragging) return
+      dragging = false
+      handle.releasePointerCapture(event.pointerId)
+      handle.classList.remove('ws-grabbing')
+    }
+    handle.addEventListener('pointerup', release)
+    handle.addEventListener('pointercancel', release)
+
+    handle.addEventListener('keydown', (event) => {
+      const step = event.shiftKey ? 0.1 : 0.01
+      const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
+      const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0
+      if (dx === 0 && dy === 0) return
+      // Swallowed rather than allowed to bubble: the global map would otherwise read the same
+      // arrow keys as a gain or frequency change while the handle has focus.
+      event.preventDefault()
+      event.stopPropagation()
+      const split = this.deps.config.split
+      this.setSplit(split.x + dx, split.y + dy)
+    })
+
+    return handle
+  }
+
+  private setSplit(x: number, y: number): void {
+    const next = clampSplit({ x, y })
+    const split = this.deps.config.split
+    if (next.x === split.x && next.y === split.y) return
+    split.x = next.x
+    split.y = next.y
+    this.deps.onChange()
+  }
+
+  resetSplit(): void {
+    this.setSplit(0.5, 0.5)
+    this.notify('Layout reset to four equal panes')
+  }
+
+  /**
+   * Places everything that floats over the canvas but belongs to a particular pane: the axis
+   * tick labels, the pane names, and the divider cross. Called every frame with the same
+   * rectangles the renderer drew into, so a label cannot end up over the wrong visualisation.
+   */
+  setPanes(panes: readonly Pane[], groups: readonly { pane: Pane; ticks: AxisTick[] }[]): void {
+    const style = this.deps.config.style
+    const width = panes.reduce((m, p) => Math.max(m, p.x + p.width), 1)
+    const height = panes.reduce((m, p) => Math.max(m, p.y + p.height), 1)
+
+    this.syncSplitHandle(panes, width, height)
+    this.syncPaneLabels(panes)
+
+    const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
+    let used = 0
+    for (const { pane, ticks } of groups) {
+      // Below this a pane is a sliver, and the labels would be all there is to see in it.
+      if (!style.showLabels || pane.width < 90 || pane.height < 70) continue
+      // Only the bottom row has to clear the readout bar.
+      const onBottom = pane.y + pane.height >= height - 1
+      const bottomGap = onBottom && style.showReadout ? 42 : 16
+
+      for (const tick of ticks) {
+        const node = this.tickNode(used++)
+        node.style.display = ''
+        node.textContent = tick.label
+        if (tick.horizontal) {
+          node.style.left = `${pane.x + 5}px`
+          node.style.top = `${pane.y + clamp(tick.pos * pane.height, 9, pane.height - bottomGap)}px`
+          node.dataset.axis = 'y'
+        } else {
+          node.style.left = `${pane.x + clamp(tick.pos * pane.width, 18, pane.width - 18)}px`
+          node.style.top = `${pane.y + pane.height - bottomGap + 4}px`
+          node.dataset.axis = 'x'
+        }
+      }
+    }
+    for (let i = used; i < this.labelPool.length; i++) this.labelPool[i].style.display = 'none'
+  }
+
+  private tickNode(index: number): HTMLElement {
+    let node = this.labelPool[index]
+    if (!node) {
+      node = document.createElement('span')
       node.className = 'ws-tick'
       this.labelLayer.append(node)
-      this.labelPool.push(node)
+      this.labelPool[index] = node
     }
-    for (let i = 0; i < this.labelPool.length; i++) {
-      const node = this.labelPool[i]
-      const tick = ticks[i]
-      if (!tick || !this.deps.config.style.showLabels) {
+    return node
+  }
+
+  private syncSplitHandle(panes: readonly Pane[], width: number, height: number): void {
+    const cutX = panes[0]?.width ?? width / 2
+    const cutY = panes[0]?.height ?? height / 2
+    this.splitHandle.style.left = `${cutX}px`
+    this.splitHandle.style.top = `${cutY}px`
+    this.splitLineY.style.left = `${cutX}px`
+    this.splitLineX.style.top = `${cutY}px`
+    // A divider with nothing on one side of it is just a border on the viewport edge.
+    this.splitLineY.style.display = cutX > 0 && cutX < width ? '' : 'none'
+    this.splitLineX.style.display = cutY > 0 && cutY < height ? '' : 'none'
+  }
+
+  private syncPaneLabels(panes: readonly Pane[]): void {
+    const show = this.deps.config.style.showLabels
+    for (let i = 0; i < PANE_SPECS.length; i++) {
+      let node = this.paneLabels[i]
+      if (!node) {
+        node = document.createElement('span')
+        node.className = 'ws-pane-name'
+        this.labelLayer.append(node)
+        this.paneLabels[i] = node
+      }
+      const pane = panes[i]
+      if (!show || !pane || !pane.visible || pane.width < 90 || pane.height < 40) {
         node.style.display = 'none'
         continue
       }
       node.style.display = ''
-      node.textContent = tick.label
-      // Labels are nudged away from the edges so the outermost tick is not half-clipped, and
-      // the time axis sits clear of the readout bar along the bottom.
-      const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
-      if (tick.horizontal) {
-        node.style.left = '6px'
-        node.style.top = `${clamp(tick.pos * height, 9, height - 46)}px`
-        node.dataset.axis = 'y'
-      } else {
-        node.style.left = `${clamp(tick.pos * width, 18, width - 18)}px`
-        node.style.top = `${height - 44}px`
-        node.dataset.axis = 'x'
-      }
+      node.textContent = pane.label
+      // Top right: the value axis puts its labels down the left edge, and the two would sit on
+      // top of each other in every pane.
+      node.style.left = `${pane.x + pane.width - 6}px`
+      node.style.top = `${pane.y + 5}px`
+      // The focused pane is the one the contextual keys drive; it is worth being able to see
+      // which that is without opening the panel.
+      node.classList.toggle('ws-pane-focus', pane.mode === this.deps.config.mode)
     }
   }
 
@@ -650,21 +815,8 @@ export class Overlay {
         text: 'Echo cancellation, noise suppression and automatic gain control are all disabled on the captured track. Chrome enables all three by default and AGC alone makes level measurement meaningless.',
       },
       {
-        kind: 'row',
-        children: [
-          {
-            kind: 'button',
-            label: 'Start / restart capture',
-            action: 'restart',
-            onClick: () => this.deps.onRestartSource(),
-          },
-          {
-            kind: 'button',
-            label: 'Stop',
-            action: 'stop',
-            onClick: () => this.deps.onStopSource(),
-          },
-        ],
+        kind: 'note',
+        text: 'Capture opens on its own once a device is bound — on load, when one is plugged in, and when the settings above change. The transport at the top of this panel starts and stops it by hand: ▶ on r, ❚❚ on shift R.',
       },
       {
         kind: 'slider',

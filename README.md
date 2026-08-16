@@ -15,17 +15,38 @@ Requires WebGPU: Chrome/Edge 113+, Safari 26+, Firefox 141+.
 
 ## What it does
 
-Four modes, one capture and transform core, switchable with `1`–`4`:
+Four visualisations, one capture and transform core, all on screen at once:
 
-| Mode | What it shows |
+```
+        ┌───────────────────┬───────────────────┐
+        │                   │                   │
+        │     Waveform      │     Spectrum      │
+        │                   │                   │
+        ├───────────────────◉───────────────────┤
+        │                   │                   │
+        │    Spectrogram    │    Vectorscope    │
+        │                   │                   │
+        └───────────────────┴───────────────────┘
+                 drag the centre to resize
+```
+
+| Pane | What it shows |
 | --- | --- |
 | **Waveform** | Pitch-locked oscilloscope. GPU min/max/RMS envelope when zoomed out, band-limited sinc reconstruction when zoomed in. |
 | **Spectrum** | FFT magnitude with per-pixel bin reduction, peak hold, Welch averaging, eleven windows. |
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
 | **Vectorscope** | Mid/side goniometer with phase correlation. |
 
-Press `space`, `esc` or `h` to toggle the overlay, `f` for full screen, `?` for the keyboard
-reference.
+The cross that divides them has one degree of freedom per axis, so the four panes always tile
+the viewport exactly. Push it against a rail and two of them collapse to nothing; push it into a
+corner and one fills the screen. **Collapsing is the off switch** — a pane with no room to draw
+in is skipped by the renderer *and* by the analyzer, so closing both spectral panes stops the
+FFT chain running at all. Its position is remembered between sessions, and ↺ in the panel header
+puts it back in the middle.
+
+Capture starts on its own — there is no button to find before the first trace appears. Press
+`space`, `esc` or `h` to toggle the overlay, `f` for full screen, `?` for the keyboard
+reference. Transport (▶ / ❚❚ / ↺) sits at the top of the panel, on `r` and `shift R`.
 
 ---
 
@@ -43,7 +64,7 @@ increasing.
 | `f` | Full screen |
 | `?` `F1` | Keyboard reference |
 | `` ` `` `~` | Next / previous panel tab |
-| `1` `2` `3` `4` | Waveform · Spectrum · Spectrogram · Vectorscope |
+| `1` `2` `3` `4` | Focus a pane — all four are visible, so this only aims the contextual keys |
 | `-` `=` | FFT size |
 | `[` `]` | Hop size |
 | `q` `w` | Window function |
@@ -129,6 +150,34 @@ arithmetic.
 ---
 
 ## Decisions worth explaining
+
+**Four panes, four viewports, one uniform buffer with four slots.** Every shader works in
+pixels and converts with `toNdc`, so handing one the *pane's* resolution and then pointing the
+viewport at the pane's rectangle relocates a whole visualisation without a line of shader code
+knowing that it moved. What makes that need care is the ordering rule above: `writeBuffer` is
+ordered ahead of the entire command buffer, so four draws in one submission cannot see four
+different values of the same uniform range. Each pane therefore gets its own 256-byte slot and
+its own bind group, and the graticules for all four are packed into one storage buffer with
+`firstInstance` selecting each pane's range. The one thing the post chain treats per-pane is
+phosphor persistence, which the spectrogram is exempted from — its axis is already time — by
+scissoring the decay draw to that rectangle and running it again with a blend constant of zero.
+
+**Capture opens itself, but never prompts.** An analyzer that shows a flat line until you find
+the start button is a broken analyzer, so capture opens on load, when a device is plugged in,
+and when the capture settings change. The condition is that it can be done without putting
+anything on screen the user did not ask for: a device counts as *bound* when its name is
+readable, because the browser redacts device labels until the page already holds a microphone
+permission. Naming a specific device narrows the test to that device, since `deviceId: exact`
+fails rather than falling back. Screen share and file sources always wait for a click — one
+needs a picker, the other a file.
+
+**A context that starts unattended is a context that is suspended.** Autoplay policy parks an
+`AudioContext` created without user activation, and Chrome does not *reject* `resume()` in that
+state — it leaves the promise pending, indefinitely, until a gesture that may never come.
+Awaiting it directly hangs the whole start on an untouched page, so the resume is raced against
+a short deadline, the real state is published rather than the requested one, and the next click
+or keystroke anywhere on the page is borrowed to let the audio through. The transport pulses
+and the readout says `held` until it does.
 
 **Capture is undefended.** `echoCancellation`, `noiseSuppression` and `autoGainControl` are all
 forced off. Chrome enables all three by default and AGC alone makes level measurement
@@ -284,7 +333,7 @@ src/
   dsp/      windows, reference FFT, biquads, BS.1770-4 loudness, tests
   gpu/      device init, compute orchestration, render passes
     shaders/  WGSL: prepare, fft, unpack, analyze, envelope, nsdf, speccols, draw_*, post
-  ui/       tabbed overlay, controls, keyboard map and reference, themes, graticule
+  ui/       tabbed overlay, quad layout, controls, keyboard map and reference, themes, graticule
   workers/  loudness metering
 ```
 

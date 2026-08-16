@@ -95,6 +95,102 @@ body {
   transform: translate(-50%, 0);
 }
 
+.ws-pane-name {
+  position: absolute;
+  transform: translateX(-100%);
+  font-family: var(--ws-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ws-canvas-ink-soft);
+  background: var(--ws-canvas-scrim);
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+.ws-pane-name.ws-pane-focus {
+  color: var(--ws-accent);
+}
+
+/* ---------------------------------------------------------------- pane split */
+
+/*
+ * The layer spans the viewport so the handle can be positioned in its coordinates, but only the
+ * handle itself takes the pointer — anything else here would swallow clicks meant for the
+ * canvas across the whole screen.
+ */
+.ws-split {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ws-split-line {
+  position: absolute;
+  background: var(--ws-canvas-ink-soft);
+  opacity: 0.28;
+}
+
+.ws-split-line-x {
+  left: 0;
+  right: 0;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
+
+.ws-split-line-y {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+
+.ws-grab {
+  position: absolute;
+  appearance: none;
+  pointer-events: auto;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ws-line-strong);
+  border-radius: 50%;
+  background: var(--ws-panel);
+  backdrop-filter: var(--ws-blur);
+  -webkit-backdrop-filter: var(--ws-blur);
+  color: var(--ws-muted);
+  cursor: move;
+  touch-action: none;
+  transition: color 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+}
+
+.ws-grab svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.ws-grab:hover,
+.ws-grab:focus-visible {
+  color: var(--ws-accent);
+  border-color: var(--ws-accent-line);
+}
+
+.ws-grab:focus-visible {
+  outline: 2px solid var(--ws-accent);
+  outline-offset: 2px;
+}
+
+.ws-grab.ws-grabbing {
+  color: var(--ws-accent);
+  border-color: var(--ws-accent-line);
+  transform: scale(1.12);
+}
+
 /* ---------------------------------------------------------------- readout bar */
 
 .ws-readout {
@@ -230,53 +326,60 @@ body {
   background: var(--ws-surface);
 }
 
-.ws-modes {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 4px;
-  padding: 10px 12px;
+.ws-header-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 3px;
+  background: var(--ws-line);
 }
 
-.ws-mode {
-  appearance: none;
-  border: 1px solid transparent;
-  background: var(--ws-surface);
-  color: var(--ws-muted);
-  border-radius: 7px;
-  padding: 8px 4px 7px;
-  font-size: 11px;
-  font-family: inherit;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
+/* ---------------------------------------------------------------- transport */
+
+.ws-transport {
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  width: 26px;
+  height: 22px;
+  padding: 0;
 }
 
-.ws-mode kbd {
-  font-family: var(--ws-mono);
-  font-size: 9px;
-  color: var(--ws-faint);
-  border: 1px solid var(--ws-line);
-  border-radius: 3px;
-  padding: 0 3px;
+.ws-transport svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
 }
 
-.ws-mode:hover {
-  color: var(--ws-text);
-}
-
-.ws-mode.ws-active {
-  background: var(--ws-accent-soft);
+.ws-transport.ws-active {
+  color: var(--ws-accent);
   border-color: var(--ws-accent-line);
-  color: var(--ws-text);
+  background: var(--ws-accent-soft);
 }
 
-/*
- * The tabs wrap rather than scroll. A horizontal scroller hides the tabs that do not fit behind
- * an edge with no affordance, and there are enough of them now that the last one would never be
- * found.
- */
+/* Started, but held suspended by autoplay policy: running and not running at once. */
+.ws-transport.ws-pending {
+  color: var(--ws-accent);
+  border-color: var(--ws-accent-line);
+  animation: ws-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ws-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.ws-transport:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+.ws-transport:disabled:hover {
+  color: var(--ws-muted);
+  border-color: var(--ws-line);
+  background: transparent;
+}
+
 .ws-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -914,6 +1017,14 @@ body {
   .ws-toast,
   .ws-check,
   .ws-check::after {
+    transition: none;
+  }
+
+  .ws-transport.ws-pending {
+    animation: none;
+  }
+
+  .ws-grab {
     transition: none;
   }
 }

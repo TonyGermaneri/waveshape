@@ -1,12 +1,13 @@
 import './app.css'
 
-import { channelMix, loadConfig, saveConfig, type Config } from './config.ts'
+import { channelMix, loadConfig, saveConfig, type Config, type Mode } from './config.ts'
 import { AudioEngine, type EngineStatus } from './audio/engine.ts'
 import { AudioRing, type RingReader } from './audio/ring.ts'
 import { initGpu, WebGpuUnavailableError, type GpuContext } from './gpu/device.ts'
 import { Analyzer } from './gpu/analyzer.ts'
 import { Renderer } from './gpu/renderer.ts'
 import { buildGraticule } from './ui/axes.ts'
+import { computePanePair } from './ui/layout.ts'
 import { Overlay, type OverlayStatus } from './ui/overlay.ts'
 import { dispatchKey, type KeyActions } from './ui/keymap.ts'
 import { buildWindowTables } from './dsp/windows.ts'
@@ -149,6 +150,7 @@ async function main(): Promise<void> {
       renderer.invalidate()
       attachMeters(engine.ring)
       overlay.setDevices(await engine.listInputs())
+      armResumeOnGesture()
     } catch (error) {
       // Surface the failure in three places: the console for the stack, the System tab for the
       // message, and the readout so it is visible without opening anything.
@@ -177,6 +179,108 @@ async function main(): Promise<void> {
     config.source.kind = 'file'
     void startSource()
   })
+
+  // ------------------------------------------------------------------ automatic capture
+  //
+  // An analyzer that shows a flat line until you find the start button is a broken analyzer.
+  // Capture therefore opens by itself whenever it can do so without putting something on
+  // screen the user did not ask for: on load, when a device appears, and when the capture
+  // settings change. "Can" is the whole question — a permission prompt, a screen-share picker
+  // and a file dialog are all things that must follow a deliberate click, so those sources
+  // wait to be started by hand.
+
+  /** Sources that can be opened unattended, given the right conditions. */
+  function sourceIsSelfStarting(): boolean {
+    const kind = config.source.kind
+    return kind === 'microphone' || kind === 'generator'
+  }
+
+  async function canAutoStart(): Promise<boolean> {
+    if (engineStatus.running || !sourceIsSelfStarting()) return false
+    // The generator is synthesis: no device, no permission, nothing to prompt for.
+    if (config.source.kind === 'generator') return true
+    return engine.isInputBound(config.source.deviceId || undefined)
+  }
+
+  let autoStarting = false
+  async function autoStartIfBound(): Promise<void> {
+    if (autoStarting) return
+    autoStarting = true
+    try {
+      if (await canAutoStart()) await startSource()
+    } finally {
+      autoStarting = false
+    }
+  }
+
+  /**
+   * A context created without a user gesture can be parked in `suspended` by autoplay policy,
+   * where it pulls no audio at all. Nothing can be done about that from script — so the next
+   * click or keystroke anywhere on the page is borrowed to release it.
+   */
+  let resumeArmed = false
+  function armResumeOnGesture(): void {
+    if (resumeArmed || !engineStatus.suspended) return
+    resumeArmed = true
+    const release = () => {
+      window.removeEventListener('pointerdown', release, true)
+      window.removeEventListener('keydown', release, true)
+      resumeArmed = false
+      // Not every event grants activation. If the context is still parked, wait for one that
+      // does rather than giving up after the first try.
+      void engine.resume().then((running) => {
+        if (!running) armResumeOnGesture()
+      })
+    }
+    window.addEventListener('pointerdown', release, true)
+    window.addEventListener('keydown', release, true)
+    overlay.notify('Audio is held by the browser until you click or press a key')
+  }
+
+  engine.onSourceEnded = () => {
+    analyzer.attach(null)
+    renderer.invalidate()
+    attachMeters(null)
+    overlay.notify(engine.status.message || 'Capture device disconnected')
+    void engine.listInputs().then((devices) => overlay.setDevices(devices))
+  }
+
+  // Hardware arriving or leaving. The same event covers both, and `canAutoStart` decides:
+  // if the configured device is the one that just appeared, capture picks up on its own.
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+    void (async () => {
+      overlay.setDevices(await engine.listInputs())
+      await autoStartIfBound()
+    })()
+  })
+
+  // Re-open when the capture settings themselves change — a different device, rate or channel
+  // count is a different capture, and the old one is no longer what the panel is describing.
+  function sourceSettingsSignature(): string {
+    const s = config.source
+    // Only the discrete choices. The generator's frequency and amplitude are sliders, and
+    // re-opening the AudioContext on every tick of a drag would be a very expensive way to
+    // change a number; those take effect on the next start, like they always have.
+    return `${s.kind}|${s.deviceId}|${s.sampleRate}|${s.channels}|${s.generator.kind}`
+  }
+
+  let sourceSignature = sourceSettingsSignature()
+  let sourceEditTimer = 0
+
+  function reactToSourceEdit(): void {
+    const signature = sourceSettingsSignature()
+    if (signature === sourceSignature) return
+    sourceSignature = signature
+    if (config.source.kind === 'file' && !pendingFile) return
+    // Coalesce: switching device and rate in quick succession should open the device once.
+    window.clearTimeout(sourceEditTimer)
+    sourceEditTimer = window.setTimeout(() => {
+      void (async () => {
+        if (engineStatus.running) await startSource()
+        else await autoStartIfBound()
+      })()
+    }, 150)
+  }
 
   // ------------------------------------------------------------------ overlay
   let fps = 60
@@ -238,6 +342,7 @@ async function main(): Promise<void> {
     gpuInfo: gpu.info,
     onChange: () => {
       engine.setMonitorGain(config.source.monitorGain)
+      reactToSourceEdit()
       scheduleSave()
     },
     onRestartSource: () => void startSource(),
@@ -261,6 +366,8 @@ async function main(): Promise<void> {
   })
 
   void engine.listInputs().then((devices) => overlay.setDevices(devices))
+  // Open the input straight away if the browser already trusts us with one.
+  void autoStartIfBound()
 
   // ------------------------------------------------------------------ input
   const keyActions: KeyActions = {
@@ -335,7 +442,11 @@ async function main(): Promise<void> {
 
   function frame(now: number): void {
     requestAnimationFrame(frame)
+    draw(now)
+  }
 
+  /** One frame's work, with no scheduling in it, so it can also be stepped by hand. */
+  function draw(now: number): void {
     const dt = now - lastFrameTime
     lastFrameTime = now
     if (dt > 0) fps += (1000 / dt - fps) * 0.08
@@ -365,8 +476,16 @@ async function main(): Promise<void> {
     const requested = channelMix(config.analysis.channelMode)
     const mix = requested.mix
     const count = analyzer.ringChannels === 1 ? 1 : requested.count
-    const mode = config.mode
-    const spectral = mode === 'spectrum' || mode === 'spectrogram'
+
+    // All four panes are on screen, so what the analyzer computes is decided by which of them
+    // still has room to be drawn in rather than by a mode. Collapsing a pane to nothing is what
+    // switches its part of the pipeline off — the FFT chain stops running when neither spectral
+    // pane is open, and the envelope reduction stops when the oscilloscope is closed.
+    const panes = computePanePair(config.split, cssWidth, cssHeight, pixelWidth, pixelHeight)
+    const open = (mode: Mode) => panes.some((p) => p.visible && p.css.mode === mode)
+    const wavePane = panes.find((p) => p.css.mode === 'wave')
+    const spectrumPane = panes.find((p) => p.css.mode === 'spectrum')
+    const spectral = open('spectrum') || open('spectrogram')
 
     // The fixed span is what the trigger falls back to; when pitch-locked and confident, the
     // GPU replaces it with an exact number of detected periods.
@@ -401,13 +520,13 @@ async function main(): Promise<void> {
         spanSamples,
       },
       axis: {
-        columns: mode === 'spectrum' ? Math.min(4096, pixelWidth) : 0,
+        columns: open('spectrum') ? Math.min(4096, spectrumPane!.device.width) : 0,
         logFrequency: config.spectrum.logFrequency,
         freqMin: config.spectrum.freqMin,
         freqMax: Math.min(config.spectrum.freqMax, nyquist),
         source: config.spectrum.source,
       },
-      waveColumns: mode === 'wave' ? Math.min(4096, pixelWidth) : 0,
+      waveColumns: open('wave') ? Math.min(4096, wavePane!.device.width) : 0,
       maxFramesPerRender: config.perf.maxFramesPerRender,
       spectral,
     })
@@ -424,16 +543,25 @@ async function main(): Promise<void> {
       analysisWindowStart = now
     }
 
-    // The displayed span comes from the GPU-resolved timebase, so the graticule agrees with
-    // the trace even when the pitch lock has changed the window under it.
-    const shownSeconds =
-      mode === 'wave' ? analyzer.timebase[1] / sampleRate : config.wave.timebaseMs / 1000
-    const graticule = buildGraticule(mode, config, shownSeconds, nyquist)
+    // The waveform's displayed span comes from the GPU-resolved timebase, so its graticule
+    // agrees with the trace even when the pitch lock has changed the window under it.
+    const waveSeconds = analyzer.timebase[1] / sampleRate || config.wave.timebaseMs / 1000
+    const visible = panes.filter((p) => p.visible)
+    const graticules = visible.map((pane) => {
+      const seconds = pane.css.mode === 'wave' ? waveSeconds : config.wave.timebaseMs / 1000
+      return { pane, seconds, graticule: buildGraticule(pane.css.mode, config, seconds, nyquist) }
+    })
 
     renderer.render(encoder, {
       config,
       stats,
-      graticule: graticule.lines,
+      panes: graticules.map(({ pane, seconds, graticule }) => ({
+        mode: pane.device.mode,
+        slot: pane.device.index,
+        rect: pane.device,
+        graticule: graticule.lines,
+        shownSeconds: seconds,
+      })),
       width: pixelWidth,
       height: pixelHeight,
       nyquist,
@@ -441,7 +569,10 @@ async function main(): Promise<void> {
     })
     device.queue.submit([encoder.finish()])
 
-    overlay.setTicks(graticule.ticks, cssWidth, cssHeight)
+    overlay.setPanes(
+      panes.map((p) => p.css),
+      graticules.map(({ pane, graticule }) => ({ pane: pane.css, ticks: graticule.ticks })),
+    )
     overlay.update()
   }
 
@@ -450,7 +581,19 @@ async function main(): Promise<void> {
     // which makes it possible to check GPU-resolved state from the console without adding
     // logging to the hot path.
     Object.assign(globalThis as Record<string, unknown>, {
-      waveshape: { config, engine, analyzer, gpu, get renderer() { return renderer }, get stats() { return lastStats } },
+      waveshape: {
+        config,
+        engine,
+        analyzer,
+        gpu,
+        overlay,
+        // Draws one frame on demand. The loop is driven by requestAnimationFrame, which a
+        // hidden tab never fires, so this is the only way to inspect a rendered frame from a
+        // window that is not on screen.
+        step: () => draw(performance.now()),
+        get renderer() { return renderer },
+        get stats() { return lastStats },
+      },
     })
   }
 

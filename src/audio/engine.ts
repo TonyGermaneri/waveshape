@@ -46,6 +46,13 @@ export interface SourceRequest {
 
 export interface EngineStatus {
   running: boolean
+  /**
+   * The graph is built but the AudioContext is not running. Autoplay policy holds a context
+   * created without a user gesture in `suspended` until the page is interacted with, and a
+   * suspended context pulls no audio at all — so this is the difference between "started" and
+   * "actually capturing".
+   */
+  suspended: boolean
   sourceLabel: string
   sampleRate: number
   channels: number
@@ -66,6 +73,25 @@ export interface AudioDeviceInfo {
 
 const RING_CAPACITY = 1 << 19 // 524288 frames: 10.9 s at 48 kHz, 2.7 s at 192 kHz
 
+/**
+ * Resume a context without the possibility of hanging on it.
+ *
+ * When autoplay policy is blocking, Chrome does not reject `resume()` — it leaves the promise
+ * *pending*, indefinitely, until the page receives a user gesture that may never come. Awaiting
+ * it directly stalls whatever called it for the entire life of an untouched page, which is
+ * precisely the situation an unattended start creates. So it is raced against a deadline: long
+ * enough that a resume which followed a click has settled before the caller reports state,
+ * short enough that one which never will does not hold anything up. The context's
+ * `statechange` event carries the late answer.
+ */
+async function resumeWithin(ctx: AudioContext, ms: number): Promise<void> {
+  if (ctx.state !== 'suspended') return
+  await Promise.race([
+    ctx.resume().catch(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  ])
+}
+
 export class AudioEngine {
   private context: AudioContext | null = null
   private stream: MediaStream | null = null
@@ -79,6 +105,7 @@ export class AudioEngine {
   ring: AudioRing | null = null
   status: EngineStatus = {
     running: false,
+    suspended: false,
     sourceLabel: 'stopped',
     sampleRate: 0,
     channels: 0,
@@ -91,6 +118,8 @@ export class AudioEngine {
   }
 
   onStatus: ((s: EngineStatus) => void) | null = null
+  /** The capture track ended on its own — the device was unplugged or the share was revoked. */
+  onSourceEnded: (() => void) | null = null
 
   /**
    * Device labels are redacted until the page holds a media permission, so callers should
@@ -105,6 +134,37 @@ export class AudioEngine {
         deviceId: d.deviceId,
         label: d.label || `Input ${i + 1}`,
       }))
+  }
+
+  /**
+   * Whether an input can be opened right now without putting a permission prompt on screen.
+   *
+   * A populated label is the tell: the browser redacts device names until the page holds a
+   * microphone permission, so a name we can read means the grant already exists. Naming a
+   * specific device narrows the question to that device, because opening a `deviceId: exact`
+   * constraint for hardware that has been unplugged fails rather than falling back.
+   */
+  async isInputBound(deviceId?: string): Promise<boolean> {
+    if (!navigator.mediaDevices?.enumerateDevices) return false
+    try {
+      const inputs = (await navigator.mediaDevices.enumerateDevices()).filter(
+        (d) => d.kind === 'audioinput',
+      )
+      if (deviceId) return inputs.some((d) => d.deviceId === deviceId && d.label !== '')
+      return inputs.some((d) => d.label !== '')
+    } catch {
+      return false
+    }
+  }
+
+  /** Lets a context that autoplay policy parked in `suspended` through, once there is a gesture. */
+  async resume(): Promise<boolean> {
+    const ctx = this.context
+    if (!ctx) return false
+    await resumeWithin(ctx, 400)
+    const running = ctx.state === 'running'
+    this.setStatus({ ...this.status, suspended: this.status.running && !running })
+    return running
   }
 
   async start(request: SourceRequest): Promise<void> {
@@ -141,6 +201,9 @@ export class AudioEngine {
 
       const track = this.stream.getAudioTracks()[0]
       if (!track) throw new Error('the selected source produced no audio track')
+      // Unplugging the interface, or ending a tab share, ends the track rather than raising
+      // anything. Without this the graph stays wired to a dead source and simply goes quiet.
+      track.addEventListener('ended', () => void this.handleSourceEnded(track))
       const settings = track.getSettings()
       deviceRate = settings.sampleRate ?? null
       label = track.label || (request.kind === 'display' ? 'Tab / system audio' : 'Microphone')
@@ -221,11 +284,18 @@ export class AudioEngine {
     this.sourceNode.connect(this.node)
     this.ring.setRunning(true)
 
-    if (ctx.state === 'suspended') await ctx.resume()
+    await resumeWithin(ctx, 150)
+    // A context started without a user gesture can be parked in `suspended` and stay there.
+    // Report the state it actually reached rather than the one that was asked for.
+    ctx.onstatechange = () => {
+      if (this.context !== ctx || !this.status.running) return
+      this.setStatus({ ...this.status, suspended: ctx.state !== 'running' })
+    }
 
     const bitPerfect = deviceRate === null || Math.abs(deviceRate - ctx.sampleRate) < 1
     this.setStatus({
       running: true,
+      suspended: ctx.state !== 'running',
       sourceLabel: label,
       sampleRate: ctx.sampleRate,
       channels,
@@ -346,6 +416,19 @@ export class AudioEngine {
     return { node: stereo, description: `${gen.kind} ${gen.frequency.toFixed(2)} Hz` }
   }
 
+  private async handleSourceEnded(track: MediaStreamTrack): Promise<void> {
+    // Ignore the `ended` that our own teardown provokes; only a spontaneous one is news.
+    if (!this.stream || !this.stream.getAudioTracks().includes(track)) return
+    const label = track.label || 'the capture device'
+    await this.stop()
+    this.setStatus({
+      ...this.status,
+      sourceLabel: 'disconnected',
+      message: `${label} went away.`,
+    })
+    this.onSourceEnded?.()
+  }
+
   setMonitorGain(value: number): void {
     if (this.monitorGain && this.context) {
       this.monitorGain.gain.setTargetAtTime(value, this.context.currentTime, 0.02)
@@ -371,11 +454,12 @@ export class AudioEngine {
     }
     if (this.context) {
       this.moduleLoadedFor = null
+      this.context.onstatechange = null
       await this.context.close().catch(() => undefined)
       this.context = null
     }
     this.ring = null
-    this.setStatus({ ...this.status, running: false, sourceLabel: 'stopped' })
+    this.setStatus({ ...this.status, running: false, suspended: false, sourceLabel: 'stopped' })
   }
 
   private setStatus(next: EngineStatus): void {

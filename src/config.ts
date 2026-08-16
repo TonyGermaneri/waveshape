@@ -32,8 +32,22 @@ export interface UiTheme {
   blur: number
 }
 
+/**
+ * Where the cross that divides the four panes sits, as a fraction of the viewport. Dragging it
+ * to a rail collapses two panes to nothing, which is how a visualisation is switched off.
+ */
+export interface LayoutSplit {
+  x: number
+  y: number
+}
+
 export interface Config {
+  /**
+   * Which pane the contextual keyboard bindings drive. All four are on screen at once, so this
+   * is a focus, not a switch — the arrow keys have to mean something in particular.
+   */
   mode: Mode
+  split: LayoutSplit
   /** Id of the theme last applied. Only used to show which entry is current. */
   themeId: string
   source: {
@@ -157,8 +171,11 @@ export const SAMPLE_RATES = [
   192000,
 ] as const
 
+export const DEFAULT_SPLIT: LayoutSplit = { x: 0.5, y: 0.5 }
+
 export const DEFAULT_CONFIG: Config = {
   mode: 'wave',
+  split: { ...DEFAULT_SPLIT },
   themeId: 'studio',
   source: {
     kind: 'microphone',

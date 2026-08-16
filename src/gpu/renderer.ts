@@ -25,6 +25,7 @@ import { channelMix } from '../config.ts'
 import { hexToLinearRgb, paletteById, rasterisePalette } from './colormap.ts'
 import type { Analyzer, FrameStats } from './analyzer.ts'
 import type { GridLine } from '../ui/axes.ts'
+import type { Rect } from '../ui/layout.ts'
 
 import commonWgsl from './shaders/common.wgsl?raw'
 import drawWaveWgsl from './shaders/draw_wave.wgsl?raw'
@@ -36,10 +37,13 @@ import sgPresentWgsl from './shaders/spectrogram_present.wgsl?raw'
 import postWgsl from './shaders/post.wgsl?raw'
 
 const SCENE_FORMAT: GPUTextureFormat = 'rgba16float'
-const MAX_GRID_LINES = 256
+const MAX_GRID_LINES = 512
 const BLOOM_DIVISOR = 4
 /** Uniform buffer slot stride; must be a multiple of minUniformBufferOffsetAlignment. */
 const POST_SLOT = 256
+/** Style is written once per pane, into its own slot of one buffer. */
+const STYLE_SLOT = 256
+const STYLE_BYTES = 160
 
 const ADDITIVE: GPUBlendState = {
   color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
@@ -52,10 +56,22 @@ const DECAY_BLEND: GPUBlendState = {
   alpha: { srcFactor: 'zero', dstFactor: 'constant', operation: 'add' },
 }
 
+/** One visualisation, its rectangle in the framebuffer, and the graticule drawn inside it. */
+export interface RenderPane {
+  mode: Mode
+  /** Index into the style buffer's slots; stable per mode, so bind groups can be cached. */
+  slot: number
+  rect: Rect
+  graticule: GridLine[]
+  /** Seconds across the pane, resolved on the GPU when the waveform is pitch-locked. */
+  shownSeconds: number
+}
+
 export interface RenderFrame {
   config: Config
   stats: FrameStats
-  graticule: GridLine[]
+  /** Visible panes only. An empty list paints the background and nothing else. */
+  panes: RenderPane[]
   width: number
   height: number
   nyquist: number
@@ -116,7 +132,7 @@ export class Renderer {
   private readonly blurPipeline: GPURenderPipeline
   private readonly presentPipeline: GPURenderPipeline
 
-  private gridBind: GPUBindGroup | null = null
+  private gridBinds: (GPUBindGroup | null)[] = [null, null, null, null]
   private waveBinds: GPUBindGroup[] = []
   private spectrumBinds: GPUBindGroup[] = []
   private vectorBind: GPUBindGroup | null = null
@@ -143,7 +159,10 @@ export class Renderer {
     const uni = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     const stor = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 
-    this.styleBuf = device.createBuffer({ label: 'style', size: 160, usage: uni })
+    // One slot per pane. `queue.writeBuffer` is ordered ahead of the whole command buffer, so
+    // four draws in one submission cannot see four different values of the same range — each
+    // pane's resolution and mode therefore need a range of their own.
+    this.styleBuf = device.createBuffer({ label: 'style', size: STYLE_SLOT * 4, usage: uni })
     this.gridBuf = device.createBuffer({ label: 'grid', size: MAX_GRID_LINES * 16, usage: stor })
     this.waveParams = [0, 1].map((i) =>
       device.createBuffer({ label: `wave-${i}`, size: 48, usage: uni }),
@@ -426,7 +445,14 @@ export class Renderer {
     this.sgPresentBind = null
   }
 
-  private writeStyle(frame: RenderFrame, mode: Mode): void {
+  /**
+   * Writes one pane's style block. The resolution is the *pane's*, not the framebuffer's: every
+   * shader works in pixels and converts with `toNdc`, so giving it the pane size and then
+   * pointing the viewport at the pane rectangle relocates the whole visualisation without a
+   * line of shader code knowing that it moved.
+   */
+  private writeStyle(frame: RenderFrame, pane: RenderPane): void {
+    const mode = pane.mode
     const s = frame.config.style
     const f = this.f32
     const u = this.u32
@@ -434,11 +460,13 @@ export class Renderer {
     const [sr, sg, sb] = hexToLinearRgb(s.secondary)
     const [ar, ag, ab] = hexToLinearRgb(s.accent)
     const [br, bg, bb] = hexToLinearRgb(s.background)
+    const width = Math.max(1, pane.rect.width)
+    const height = Math.max(1, pane.rect.height)
 
-    f[0] = frame.width
-    f[1] = frame.height
-    f[2] = 1 / frame.width
-    f[3] = 1 / frame.height
+    f[0] = width
+    f[1] = height
+    f[2] = 1 / width
+    f[3] = 1 / height
     f[4] = pr
     f[5] = pg
     f[6] = pb
@@ -478,41 +506,73 @@ export class Renderer {
     f[31] = s.gamma
     f[32] = frame.stats.sampleRate
     f[33] = frame.config.analysis.fftSize
-    f[34] = frame.width
+    f[34] = width
     f[35] = performance.now() / 1000
     u[36] = mode === 'wave' ? 0 : mode === 'spectrum' ? 1 : mode === 'spectrogram' ? 2 : 3
     u[37] = frame.channelCount
     u[38] = frame.config.spectrum.showPeak ? 1 : 0
     u[39] = frame.config.wave.showRms ? 1 : 0
 
-    this.device.queue.writeBuffer(this.styleBuf, 0, this.scratch, 0, 160)
+    this.device.queue.writeBuffer(this.styleBuf, pane.slot * STYLE_SLOT, this.scratch, 0, STYLE_BYTES)
   }
 
-  private writeGrid(lines: GridLine[]): number {
-    const count = Math.min(lines.length, MAX_GRID_LINES)
-    if (count === 0) return 0
-    const data = new Float32Array(count * 4)
-    for (let i = 0; i < count; i++) {
-      data[i * 4 + 0] = lines[i].pos
-      data[i * 4 + 1] = lines[i].horizontal ? 1 : 0
-      data[i * 4 + 2] = lines[i].weight
-      data[i * 4 + 3] = lines[i].width
+  private styleBinding(slot: number): GPUBufferBinding {
+    return { buffer: this.styleBuf, offset: slot * STYLE_SLOT, size: STYLE_BYTES }
+  }
+
+  /**
+   * Packs every pane's graticule into one buffer, returning each pane's range. The ranges are
+   * selected at draw time with `firstInstance`, which keeps one storage buffer and one bind
+   * group per pane rather than one buffer per pane.
+   */
+  private writeGrid(panes: readonly RenderPane[]): { first: number; count: number }[] {
+    const ranges: { first: number; count: number }[] = []
+    const total = panes.reduce((n, p) => n + p.graticule.length, 0)
+    const data = new Float32Array(Math.min(total, MAX_GRID_LINES) * 4)
+    let cursor = 0
+    for (const pane of panes) {
+      const first = cursor
+      for (const line of pane.graticule) {
+        if (cursor >= MAX_GRID_LINES) break
+        data[cursor * 4 + 0] = line.pos
+        data[cursor * 4 + 1] = line.horizontal ? 1 : 0
+        data[cursor * 4 + 2] = line.weight
+        data[cursor * 4 + 3] = line.width
+        cursor++
+      }
+      ranges.push({ first, count: cursor - first })
     }
-    this.device.queue.writeBuffer(this.gridBuf, 0, data)
-    return count
+    if (cursor > 0) this.device.queue.writeBuffer(this.gridBuf, 0, data, 0, cursor * 4)
+    return ranges
+  }
+
+  private gridBind(slot: number): GPUBindGroup {
+    const existing = this.gridBinds[slot]
+    if (existing) return existing
+    const bind = this.device.createBindGroup({
+      layout: this.gridPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.styleBinding(slot) },
+        { binding: 1, resource: { buffer: this.gridBuf } },
+      ],
+    })
+    this.gridBinds[slot] = bind
+    return bind
   }
 
   /** Records this frame's render passes. The caller owns the encoder and its submission. */
   render(encoder: GPUCommandEncoder, frame: RenderFrame): void {
     const cfg = frame.config
-    const mode = cfg.mode
     this.ensureTargets(frame.width, frame.height)
     this.ensurePalette(cfg.spectrogram.palette)
-    this.writeStyle(frame, mode)
-    const gridCount = cfg.style.showGrid ? this.writeGrid(frame.graticule) : 0
+    for (const pane of frame.panes) this.writeStyle(frame, pane)
+    const gridRanges = cfg.style.showGrid
+      ? this.writeGrid(frame.panes)
+      : frame.panes.map(() => ({ first: 0, count: 0 }))
 
-    if (mode === 'spectrogram') {
-      this.ensureHistory(cfg, frame.stats.sampleRate, cfg.analysis.hop, frame.height)
+    const spectrogram = frame.panes.find((p) => p.mode === 'spectrogram')
+    if (spectrogram) {
+      this.ensureHistory(cfg, frame.stats.sampleRate, cfg.analysis.hop, spectrogram.rect.height)
       this.recordSpectrogramHistory(encoder, frame)
     }
 
@@ -529,35 +589,36 @@ export class Renderer {
       ],
     })
 
-    if (gridCount > 0) {
-      if (!this.gridBind) {
-        this.gridBind = this.device.createBindGroup({
-          layout: this.gridPipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: this.styleBuf } },
-            { binding: 1, resource: { buffer: this.gridBuf } },
-          ],
-        })
-      }
-      scenePass.setPipeline(this.gridPipeline)
-      scenePass.setBindGroup(0, this.gridBind)
-      scenePass.draw(6, gridCount)
-    }
+    frame.panes.forEach((pane, i) => {
+      const { x, y, width, height } = pane.rect
+      // The viewport maps each shader's own [-1,1] onto the pane; the scissor guarantees that
+      // nothing a shader draws outside its own clip volume — the spectrogram's oversized
+      // triangle, a trace overshooting its lane — can reach a neighbouring pane.
+      scenePass.setViewport(x, y, width, height, 0, 1)
+      scenePass.setScissorRect(x, y, width, height)
 
-    switch (mode) {
-      case 'wave':
-        this.drawWave(scenePass, frame)
-        break
-      case 'spectrum':
-        this.drawSpectrum(scenePass, frame)
-        break
-      case 'spectrogram':
-        this.drawSpectrogram(scenePass, frame)
-        break
-      case 'vector':
-        this.drawVector(scenePass, frame)
-        break
-    }
+      const grid = gridRanges[i]
+      if (grid.count > 0) {
+        scenePass.setPipeline(this.gridPipeline)
+        scenePass.setBindGroup(0, this.gridBind(pane.slot))
+        scenePass.draw(6, grid.count, 0, grid.first)
+      }
+
+      switch (pane.mode) {
+        case 'wave':
+          this.drawWave(scenePass, frame, pane)
+          break
+        case 'spectrum':
+          this.drawSpectrum(scenePass, frame, pane)
+          break
+        case 'spectrogram':
+          this.drawSpectrogram(scenePass, frame, pane)
+          break
+        case 'vector':
+          this.drawVector(scenePass, frame, pane)
+          break
+      }
+    })
     scenePass.end()
 
     this.recordPost(encoder, frame)
@@ -567,13 +628,13 @@ export class Renderer {
   // Mode geometry
   // -------------------------------------------------------------------------------------
 
-  private waveBind(index: number): GPUBindGroup {
+  private waveBind(index: number, slot: number): GPUBindGroup {
     const existing = this.waveBinds[index]
     if (existing) return existing
     const bind = this.device.createBindGroup({
       layout: this.waveLayout,
       entries: [
-        { binding: 0, resource: { buffer: this.styleBuf } },
+        { binding: 0, resource: this.styleBinding(slot) },
         { binding: 1, resource: { buffer: this.analyzer.envBuf } },
         { binding: 2, resource: { buffer: this.analyzer.audioBuffer! } },
         { binding: 3, resource: { buffer: this.analyzer.timebaseBuf } },
@@ -584,23 +645,23 @@ export class Renderer {
     return bind
   }
 
-  private drawWave(pass: GPURenderPassEncoder, frame: RenderFrame): void {
+  private drawWave(pass: GPURenderPassEncoder, frame: RenderFrame, pane: RenderPane): void {
     if (!this.analyzer.audioBuffer) return
     const cfg = frame.config
     const { mix } = channelMix(cfg.analysis.channelMode)
     const split = cfg.wave.splitChannels && frame.channelCount > 1
     const lanes = split ? frame.channelCount : 1
-    const columns = Math.min(4096, Math.max(2, Math.round(frame.width)))
+    const columns = Math.min(4096, Math.max(2, Math.round(pane.rect.width)))
 
     const spanSamples = (cfg.wave.timebaseMs / 1000) * frame.stats.sampleRate
-    const samplesPerPixel = spanSamples / Math.max(1, frame.width)
+    const samplesPerPixel = spanSamples / Math.max(1, pane.rect.width)
     // Below ~2 samples per pixel a straight-line join between samples is visibly not the
     // signal, so switch to band-limited reconstruction.
     const bandlimited =
       cfg.wave.trace === 'bandlimited' || (cfg.wave.trace === 'auto' && samplesPerPixel < 2)
 
     for (let i = 0; i < lanes; i++) {
-      const laneHeight = frame.height / lanes
+      const laneHeight = pane.rect.height / lanes
       const u = this.u32
       const f = this.f32
       u[0] = columns
@@ -617,7 +678,7 @@ export class Renderer {
       f[11] = 0
       this.device.queue.writeBuffer(this.waveParams[i], 0, this.scratch, 0, 48)
 
-      const bind = this.waveBind(i)
+      const bind = this.waveBind(i, pane.slot)
       if (bandlimited) {
         pass.setPipeline(this.tracePipeline)
         pass.setBindGroup(0, bind)
@@ -631,14 +692,14 @@ export class Renderer {
     }
   }
 
-  private drawSpectrum(pass: GPURenderPassEncoder, frame: RenderFrame): void {
+  private drawSpectrum(pass: GPURenderPassEncoder, frame: RenderFrame, pane: RenderPane): void {
     const cfg = frame.config
-    const columns = Math.min(4096, Math.max(2, Math.round(frame.width)))
+    const columns = Math.min(4096, Math.max(2, Math.round(pane.rect.width)))
     const split = cfg.spectrum.splitChannels && frame.channelCount > 1
     const lanes = split ? frame.channelCount : 1
 
     for (let i = 0; i < lanes; i++) {
-      const height = frame.height / lanes
+      const height = pane.rect.height / lanes
       const u = this.u32
       u[0] = columns
       u[1] = split ? i : 0
@@ -650,7 +711,7 @@ export class Renderer {
         this.spectrumBinds[i] = this.device.createBindGroup({
           layout: this.spectrumPipeline.getBindGroupLayout(0),
           entries: [
-            { binding: 0, resource: { buffer: this.styleBuf } },
+            { binding: 0, resource: this.styleBinding(pane.slot) },
             { binding: 1, resource: { buffer: this.analyzer.specColsBuf } },
             { binding: 2, resource: { buffer: this.spectrumParams[i] } },
           ],
@@ -663,7 +724,7 @@ export class Renderer {
     }
   }
 
-  private drawVector(pass: GPURenderPassEncoder, frame: RenderFrame): void {
+  private drawVector(pass: GPURenderPassEncoder, frame: RenderFrame, pane: RenderPane): void {
     const audio = this.analyzer.audioBuffer
     if (!audio) return
     // 40 ms of trace: long enough to close the figure on low-frequency material without
@@ -688,7 +749,7 @@ export class Renderer {
       this.vectorBind = this.device.createBindGroup({
         layout: this.vectorPipeline.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.styleBuf } },
+          { binding: 0, resource: this.styleBinding(pane.slot) },
           { binding: 1, resource: { buffer: audio } },
           { binding: 2, resource: { buffer: this.vectorParams } },
         ],
@@ -774,7 +835,7 @@ export class Renderer {
     this.historyHead += frame.stats.frames
   }
 
-  private drawSpectrogram(pass: GPURenderPassEncoder, frame: RenderFrame): void {
+  private drawSpectrogram(pass: GPURenderPassEncoder, frame: RenderFrame, pane: RenderPane): void {
     const history = this.history
     if (!history) return
     const cfg = frame.config
@@ -807,7 +868,7 @@ export class Renderer {
       this.sgPresentBind = this.device.createBindGroup({
         layout: this.sgPresentPipeline.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.styleBuf } },
+          { binding: 0, resource: this.styleBinding(pane.slot) },
           { binding: 1, resource: { buffer: this.sgPresentParams } },
           { binding: 2, resource: history.createView() },
           { binding: 3, resource: this.sampler },
@@ -828,8 +889,11 @@ export class Renderer {
   private recordPost(encoder: GPUCommandEncoder, frame: RenderFrame): void {
     const s = frame.config.style
     const [br, bg, bb] = hexToLinearRgb(s.background)
-    // The spectrogram already encodes time; phosphor persistence on top would only smear it.
-    const persistence = frame.config.mode === 'spectrogram' ? 0 : s.persistence
+    const persistence = s.persistence
+    // The spectrogram already encodes time, so phosphor persistence over it would only smear
+    // an axis that is already the time axis. It is the one pane exempted, which is possible
+    // because the decay is a full-screen draw and a scissor can carve a rectangle out of it.
+    const spectrogram = frame.panes.find((p) => p.mode === 'spectrogram')
     const bw = Math.max(1, Math.floor(frame.width / BLOOM_DIVISOR))
     const bh = Math.max(1, Math.floor(frame.height / BLOOM_DIVISOR))
 
@@ -866,6 +930,13 @@ export class Renderer {
     accumPass.setPipeline(this.decayPipeline)
     accumPass.setBindGroup(0, this.postBinds.decay)
     accumPass.draw(3)
+    if (persistence > 0 && spectrogram) {
+      const { x, y, width, height } = spectrogram.rect
+      accumPass.setScissorRect(x, y, width, height)
+      accumPass.setBlendConstant({ r: 0, g: 0, b: 0, a: 0 })
+      accumPass.draw(3)
+      accumPass.setScissorRect(0, 0, frame.width, frame.height)
+    }
     accumPass.setPipeline(this.copyPipeline)
     accumPass.setBindGroup(0, this.postBinds.copy)
     accumPass.draw(3)
