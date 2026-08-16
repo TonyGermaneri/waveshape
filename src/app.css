@@ -109,10 +109,6 @@ body {
   white-space: nowrap;
 }
 
-.ws-pane-name.ws-pane-focus {
-  color: var(--ws-accent);
-}
-
 /* ---------------------------------------------------------------- pane split */
 
 /*
@@ -139,24 +135,33 @@ body {
   transform: translateY(-0.5px);
 }
 
+/* `top` and `height` are written per frame: the vertical divider only spans the split rows. */
 .ws-split-line-y {
-  top: 0;
-  bottom: 0;
   width: 1px;
   transform: translateX(-0.5px);
 }
 
+/*
+ * Invisible until the pointer finds it. The handle sits in the middle of the picture, and a
+ * permanent disc there would be a permanent blemish on whatever is being measured — so it is
+ * the divider cross that says where to reach, and the handle only paints itself once it is
+ * under the cursor. The hit area is there the whole time; only the ink is conditional.
+ *
+ * `--ws-grab-size` is duplicated in ui/overlay.ts, which needs the diameter to keep the handle
+ * from hanging off the edge of the viewport.
+ */
 .ws-grab {
+  --ws-grab-size: 44px;
   position: absolute;
   appearance: none;
   pointer-events: auto;
-  width: 26px;
-  height: 26px;
-  margin: -13px 0 0 -13px;
+  width: var(--ws-grab-size);
+  height: var(--ws-grab-size);
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  transform: translate(-50%, -50%);
   border: 1px solid var(--ws-line-strong);
   border-radius: 50%;
   background: var(--ws-panel);
@@ -165,17 +170,30 @@ body {
   color: var(--ws-muted);
   cursor: move;
   touch-action: none;
-  transition: color 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+/* Parked in a corner, under the window manager's own resize grip. */
+.ws-grab.ws-grab-corner {
+  --ws-grab-size: 88px;
 }
 
 .ws-grab svg {
-  width: 16px;
-  height: 16px;
+  width: 40%;
+  height: 40%;
   fill: currentColor;
 }
 
+/*
+ * Focus and drag both count as "in use". Drag needs its own state because the pointer is
+ * captured: move quickly and the cursor leaves the element, :hover stops matching, and the
+ * handle would disappear from under the hand still holding it.
+ */
 .ws-grab:hover,
-.ws-grab:focus-visible {
+.ws-grab:focus-visible,
+.ws-grab.ws-grabbing {
+  opacity: 1;
   color: var(--ws-accent);
   border-color: var(--ws-accent-line);
 }
@@ -185,10 +203,11 @@ body {
   outline-offset: 2px;
 }
 
-.ws-grab.ws-grabbing {
-  color: var(--ws-accent);
-  border-color: var(--ws-accent-line);
-  transform: scale(1.12);
+/* Nothing hovers on a touch screen, so there the handle has to be visible to be findable. */
+@media (hover: none) {
+  .ws-grab {
+    opacity: 0.55;
+  }
 }
 
 /* ---------------------------------------------------------------- readout bar */
@@ -935,18 +954,6 @@ body {
 .ws-keylabel {
   font-size: 11.5px;
   color: var(--ws-text);
-}
-
-.ws-keyscope {
-  display: inline-block;
-  margin-left: 6px;
-  font-family: var(--ws-mono);
-  font-size: 9px;
-  letter-spacing: 0.04em;
-  color: var(--ws-faint);
-  border: 1px solid var(--ws-line);
-  border-radius: 3px;
-  padding: 0 3px;
 }
 
 .ws-dialog-foot {

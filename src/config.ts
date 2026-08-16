@@ -41,12 +41,11 @@ export interface LayoutSplit {
   y: number
 }
 
+/** Which visualisations are on. The layout is derived from this, not stored alongside it. */
+export type PaneToggles = Record<Mode, boolean>
+
 export interface Config {
-  /**
-   * Which pane the contextual keyboard bindings drive. All four are on screen at once, so this
-   * is a focus, not a switch — the arrow keys have to mean something in particular.
-   */
-  mode: Mode
+  panes: PaneToggles
   split: LayoutSplit
   /** Id of the theme last applied. Only used to show which entry is current. */
   themeId: string
@@ -174,7 +173,7 @@ export const SAMPLE_RATES = [
 export const DEFAULT_SPLIT: LayoutSplit = { x: 0.5, y: 0.5 }
 
 export const DEFAULT_CONFIG: Config = {
-  mode: 'wave',
+  panes: { wave: true, spectrum: true, spectrogram: true, vector: true },
   split: { ...DEFAULT_SPLIT },
   themeId: 'studio',
   source: {

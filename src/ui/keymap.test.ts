@@ -1,32 +1,25 @@
 /**
  * The keyboard map is the one part of the UI that fails silently: a duplicate token does not
- * throw, it just makes the second binding unreachable in whichever mode shadows it. These
- * checks enumerate every reachable state instead of trusting the table to be read carefully.
+ * throw, it just makes the second binding unreachable. These checks enumerate every reachable
+ * state instead of trusting the table to be read carefully.
  */
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_CONFIG, type Config, type Mode } from '../config.ts'
+import { DEFAULT_CONFIG, type Config } from '../config.ts'
 import { BINDINGS, KEY_GROUPS, bindingsFor, keyLabel } from './keymap.ts'
 
-const MODES: Mode[] = ['wave', 'spectrum', 'spectrogram', 'vector']
-
-/** Every configuration that changes which bindings are live, not just every mode. */
+/** Every configuration that changes which bindings are live. */
 function states(): Config[] {
-  const out: Config[] = []
-  for (const mode of MODES) {
-    for (const trigger of ['pitch', 'level', 'free'] as const) {
-      const config = structuredClone(DEFAULT_CONFIG)
-      config.mode = mode
-      config.wave.trigger = trigger
-      out.push(config)
-    }
-  }
-  return out
+  return (['pitch', 'level', 'free'] as const).map((trigger) => {
+    const config = structuredClone(DEFAULT_CONFIG)
+    config.wave.trigger = trigger
+    return config
+  })
 }
 
-test('no two bindings answer to the same keystroke at once', () => {
+test('no two bindings answer to the same keystroke, in any state', () => {
   for (const config of states()) {
     const seen = new Map<string, string>()
     for (const binding of bindingsFor(config)) {
@@ -35,12 +28,19 @@ test('no two bindings answer to the same keystroke at once', () => {
         assert.equal(
           previous,
           undefined,
-          `${stroke.token} is bound to both "${previous}" and "${binding.label}" in ${config.mode} / ${config.wave.trigger}`,
+          `${stroke.token} is bound to both "${previous}" and "${binding.label}"`,
         )
         seen.set(stroke.token, binding.label)
       }
     }
   }
+})
+
+test('no binding needs a pane to be focused: the whole table is always live', () => {
+  // The point of the review that produced this layout — every key means one thing, everywhere,
+  // so the set of reachable bindings does not depend on anything the user has to aim first.
+  const config = structuredClone(DEFAULT_CONFIG)
+  assert.equal(bindingsFor(config).length, BINDINGS.length)
 })
 
 test('every binding has at least one key, a label and a known group', () => {
@@ -78,6 +78,7 @@ test('every binding runs, mutates only the config, and reports what it did', () 
           restartSource: noop,
           stopSource: noop,
           resetMeters: noop,
+          resetLayout: noop,
           notify: noop,
           changed: noop,
         }
@@ -107,15 +108,13 @@ test('a numeric binding driven to its rail stays finite and in range', () => {
     restartSource: () => {},
     stopSource: () => {},
     resetMeters: () => {},
+    resetLayout: () => {},
     notify: () => {},
     changed: () => {},
   }
-  for (const mode of MODES) {
-    config.mode = mode
-    for (const binding of bindingsFor(config)) {
-      for (const stroke of binding.keys) {
-        for (let i = 0; i < 200; i++) binding.run({ config, actions }, stroke.arg)
-      }
+  for (const binding of bindingsFor(config)) {
+    for (const stroke of binding.keys) {
+      for (let i = 0; i < 200; i++) binding.run({ config, actions }, stroke.arg)
     }
   }
   const numbers = JSON.stringify(config).match(/-?\d+(\.\d+)?([eE][-+]?\d+)?/g) ?? []

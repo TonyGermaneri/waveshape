@@ -7,7 +7,7 @@ import { initGpu, WebGpuUnavailableError, type GpuContext } from './gpu/device.t
 import { Analyzer } from './gpu/analyzer.ts'
 import { Renderer } from './gpu/renderer.ts'
 import { buildGraticule } from './ui/axes.ts'
-import { computePanePair } from './ui/layout.ts'
+import { computeLayoutPair } from './ui/layout.ts'
 import { Overlay, type OverlayStatus } from './ui/overlay.ts'
 import { dispatchKey, type KeyActions } from './ui/keymap.ts'
 import { buildWindowTables } from './dsp/windows.ts'
@@ -379,6 +379,7 @@ async function main(): Promise<void> {
     restartSource: () => void startSource(),
     stopSource: () => void stopSource(),
     resetMeters: () => postMeters({ type: 'reset' }),
+    resetLayout: () => overlay.resetSplit(),
     notify: (text) => overlay.notify(text),
     changed: (structural) => {
       scheduleSave()
@@ -481,7 +482,15 @@ async function main(): Promise<void> {
     // still has room to be drawn in rather than by a mode. Collapsing a pane to nothing is what
     // switches its part of the pipeline off — the FFT chain stops running when neither spectral
     // pane is open, and the envelope reduction stops when the oscilloscope is closed.
-    const panes = computePanePair(config.split, cssWidth, cssHeight, pixelWidth, pixelHeight)
+    const layout = computeLayoutPair(
+      config.split,
+      config.panes,
+      cssWidth,
+      cssHeight,
+      pixelWidth,
+      pixelHeight,
+    )
+    const panes = layout.panes
     const open = (mode: Mode) => panes.some((p) => p.visible && p.css.mode === mode)
     const wavePane = panes.find((p) => p.css.mode === 'wave')
     const spectrumPane = panes.find((p) => p.css.mode === 'spectrum')
@@ -569,8 +578,8 @@ async function main(): Promise<void> {
     })
     device.queue.submit([encoder.finish()])
 
-    overlay.setPanes(
-      panes.map((p) => p.css),
+    overlay.setLayout(
+      layout.css,
       graticules.map(({ pane, graticule }) => ({ pane: pane.css, ticks: graticule.ticks })),
     )
     overlay.update()

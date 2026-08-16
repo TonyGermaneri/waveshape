@@ -8,14 +8,14 @@
  * and is reachable by assistive technology.
  */
 
-import { DEFAULT_CONFIG, FFT_SIZES, SAMPLE_RATES, type Config, type Mode } from '../config.ts'
+import { DEFAULT_CONFIG, FFT_SIZES, SAMPLE_RATES, type Config } from '../config.ts'
 import { WINDOWS, windowSpec } from '../dsp/windows.ts'
 import { PALETTES } from '../gpu/colormap.ts'
 import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
 import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
-import { PANE_SPECS, clampSplit, type Pane } from './layout.ts'
+import { PANE_SPECS, clampSplit, enabledCount, type Layout, type LayoutAxes, type Pane } from './layout.ts'
 import { fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
 import { KeyHelp } from './help.ts'
@@ -42,6 +42,16 @@ const RESET_ICON =
   '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M6 1.6a4.4 4.4 0 1 0 4.29 3.44l-1.27.28A3.1 3.1 0 1 1 6 2.9z"/><path d="M5.1 0.6 7.4 2.2 5.1 3.8z"/></svg>'
 const STOP_ICON =
   '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><rect x="3" y="2.4" width="2.4" height="7.2" rx="0.5"/><rect x="6.6" y="2.4" width="2.4" height="7.2" rx="0.5"/></svg>'
+
+/** Handle diameters in CSS pixels. Kept in step with `--ws-grab-size` in app.css. */
+const GRAB_SIZE = 44
+const GRAB_CORNER_SIZE = 88
+/**
+ * How close to both a vertical and a horizontal edge counts as a corner. One base handle's
+ * width: comfortably more than any platform's resize grip, and small enough that the large
+ * handle only appears when the split really is parked in a corner.
+ */
+const GRAB_CORNER_ZONE = GRAB_SIZE
 
 const TABS = [
   'Source',
@@ -113,6 +123,8 @@ export class Overlay {
   private labelPool: HTMLElement[] = []
   private toastTimer = 0
 
+  /** Which dividers exist, so a drag cannot move one that is not on screen. */
+  private axes: LayoutAxes = { x: true, y: true }
   private uiSignature = ''
   private userThemes: Theme[] = []
   /** Draft name for the next "save theme", kept out of the config: it is not a setting. */
@@ -421,7 +433,9 @@ export class Overlay {
     items.push(['Δf', `${s.binHz.toFixed(2)} Hz`])
     items.push(['enbw', `${s.enbwHz.toFixed(2)} Hz`])
     items.push(['rate/s', `${s.analysisFps.toFixed(0)}`])
-    if (this.deps.config.mode === 'wave' && s.pitchHz > 0) {
+    // The pitch estimate only drives the oscilloscope's trigger, so it is only worth the space
+    // in the readout while that pane is open.
+    if (this.deps.config.panes.wave && s.pitchHz > 0) {
       items.push(['pitch', `${s.pitchHz.toFixed(2)} Hz`])
       items.push(['clarity', s.clarity.toFixed(2)])
     }
@@ -504,9 +518,13 @@ export class Overlay {
   private setSplit(x: number, y: number): void {
     const next = clampSplit({ x, y })
     const split = this.deps.config.split
-    if (next.x === split.x && next.y === split.y) return
-    split.x = next.x
-    split.y = next.y
+    // Writing an axis that is not on screen would silently rearrange a layout the user cannot
+    // see, and surprise them when they switch a pane back on.
+    const wantX = this.axes.x ? next.x : split.x
+    const wantY = this.axes.y ? next.y : split.y
+    if (wantX === split.x && wantY === split.y) return
+    split.x = wantX
+    split.y = wantY
     this.deps.onChange()
   }
 
@@ -520,13 +538,13 @@ export class Overlay {
    * tick labels, the pane names, and the divider cross. Called every frame with the same
    * rectangles the renderer drew into, so a label cannot end up over the wrong visualisation.
    */
-  setPanes(panes: readonly Pane[], groups: readonly { pane: Pane; ticks: AxisTick[] }[]): void {
+  setLayout(layout: Layout, groups: readonly { pane: Pane; ticks: AxisTick[] }[]): void {
     const style = this.deps.config.style
-    const width = panes.reduce((m, p) => Math.max(m, p.x + p.width), 1)
-    const height = panes.reduce((m, p) => Math.max(m, p.y + p.height), 1)
+    const height = layout.height
 
-    this.syncSplitHandle(panes, width, height)
-    this.syncPaneLabels(panes)
+    this.axes = layout.axes
+    this.syncSplitHandle(layout)
+    this.syncPaneLabels(layout.panes)
 
     const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
     let used = 0
@@ -566,16 +584,53 @@ export class Overlay {
     return node
   }
 
-  private syncSplitHandle(panes: readonly Pane[], width: number, height: number): void {
-    const cutX = panes[0]?.width ?? width / 2
-    const cutY = panes[0]?.height ?? height / 2
-    this.splitHandle.style.left = `${cutX}px`
-    this.splitHandle.style.top = `${cutY}px`
+  private syncSplitHandle(layout: Layout): void {
+    const { axes, rowSplit, cutX, cutY, width, height } = layout
+
+    // The vertical divider spans only the rows that are actually divided. With three panes the
+    // bottom one runs the full width, and a line drawn across it would claim a division that
+    // is not there.
+    const top = rowSplit[0] ? 0 : cutY
+    const bottom = rowSplit[1] ? height : cutY
     this.splitLineY.style.left = `${cutX}px`
+    this.splitLineY.style.top = `${top}px`
+    this.splitLineY.style.height = `${Math.max(0, bottom - top)}px`
     this.splitLineX.style.top = `${cutY}px`
-    // A divider with nothing on one side of it is just a border on the viewport edge.
-    this.splitLineY.style.display = cutX > 0 && cutX < width ? '' : 'none'
-    this.splitLineX.style.display = cutY > 0 && cutY < height ? '' : 'none'
+    // A divider is drawn only where a division exists, and only where there is something on
+    // both sides of it — otherwise it is a border on the edge of the viewport.
+    this.splitLineY.style.display = axes.x && cutX > 0 && cutX < width && bottom > top ? '' : 'none'
+    this.splitLineX.style.display = axes.y && cutY > 0 && cutY < height ? '' : 'none'
+
+    // A single pane has no divider to move. The handle is removed rather than disabled: an
+    // invisible control that swallows pointer events over the middle of the picture would be
+    // worse than no control at all.
+    if (!axes.x && !axes.y) {
+      this.splitHandle.style.display = 'none'
+      return
+    }
+    this.splitHandle.style.display = ''
+
+    // In a corner the handle is sharing its pixels with the operating system's window resize
+    // grip, which wins every fight over a pointer. Growing it there — and only there — leaves
+    // enough of it outside the grip to be grabbed. Anywhere else the base size is plenty and a
+    // larger target would just be a bigger dead zone over the trace.
+    const nearX = axes.x && (cutX < GRAB_CORNER_ZONE || cutX > width - GRAB_CORNER_ZONE)
+    const nearY = axes.y && (cutY < GRAB_CORNER_ZONE || cutY > height - GRAB_CORNER_ZONE)
+    // With only one divider the handle rides its midpoint and never reaches a corner, so the
+    // window's resize grip is not in play.
+    const corner = nearX && nearY
+    this.splitHandle.classList.toggle('ws-grab-corner', corner)
+
+    // Held fully on screen rather than centred on the split: at a rail the cross itself is on
+    // the viewport edge, and a handle centred there would be half outside the window.
+    const half = (corner ? GRAB_CORNER_SIZE : GRAB_SIZE) / 2
+    const inside = (v: number, extent: number) =>
+      Math.min(Math.max(v, Math.min(half, extent / 2)), Math.max(extent - half, extent / 2))
+    // On an axis that does not exist the handle has no divider to sit on, so it sits halfway
+    // along the one that does.
+    this.splitHandle.style.left = `${inside(axes.x ? cutX : width / 2, width)}px`
+    this.splitHandle.style.top = `${inside(axes.y ? cutY : height / 2, height)}px`
+    this.splitHandle.style.cursor = axes.x && axes.y ? 'move' : axes.x ? 'col-resize' : 'row-resize'
   }
 
   private syncPaneLabels(panes: readonly Pane[]): void {
@@ -599,9 +654,6 @@ export class Overlay {
       // top of each other in every pane.
       node.style.left = `${pane.x + pane.width - 6}px`
       node.style.top = `${pane.y + 5}px`
-      // The focused pane is the one the contextual keys drive; it is worth being able to see
-      // which that is without opening the panel.
-      node.classList.toggle('ws-pane-focus', pane.mode === this.deps.config.mode)
     }
   }
 
@@ -614,10 +666,8 @@ export class Overlay {
    * control it drives. A label that no longer matches a binding simply prints nothing, which is
    * the failure mode you want: a missing hint rather than a wrong one.
    */
-  private keysFor(label: string, mode?: Mode): string[] | undefined {
-    const binding = BINDINGS.find(
-      (b) => b.label === label && (!mode || !b.modes || b.modes.includes(mode)),
-    )
+  private keysFor(label: string): string[] | undefined {
+    const binding = BINDINGS.find((b) => b.label === label)
     return binding?.keys.filter((k) => !k.alias).map((k) => keyLabel(k.token))
   }
 
@@ -1013,7 +1063,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Time span',
-        keys: this.keysFor('Time span', 'wave'),
+        keys: this.keysFor('Time span'),
         min: 0.05,
         max: 5000,
         step: 0.01,
@@ -1029,7 +1079,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Trigger',
-        keys: this.keysFor('Trigger', 'wave'),
+        keys: this.keysFor('Trigger'),
         options: [
           { value: 'pitch', label: 'Pitch-locked (NSDF)' },
           { value: 'level', label: 'Level' },
@@ -1044,7 +1094,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Cycles shown',
-        keys: this.keysFor('Cycles shown', 'wave'),
+        keys: this.keysFor('Cycles shown'),
         min: 0.25,
         max: 32,
         step: 0.25,
@@ -1058,7 +1108,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Clarity threshold',
-        keys: this.keysFor('Clarity threshold', 'wave'),
+        keys: this.keysFor('Clarity threshold'),
         min: 0,
         max: 1,
         step: 0.01,
@@ -1106,7 +1156,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Trigger level',
-        keys: this.keysFor('Trigger level', 'wave'),
+        keys: this.keysFor('Trigger level'),
         min: -1,
         max: 1,
         step: 0.001,
@@ -1134,7 +1184,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Reconstruction',
-        keys: this.keysFor('Reconstruction', 'wave'),
+        keys: this.keysFor('Reconstruction'),
         options: [
           { value: 'auto', label: 'Automatic' },
           { value: 'envelope', label: 'Min/max envelope' },
@@ -1149,7 +1199,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Vertical gain',
-        keys: this.keysFor('Vertical gain', 'wave'),
+        keys: this.keysFor('Vertical gain'),
         min: 0.05,
         max: 64,
         step: 0.01,
@@ -1163,7 +1213,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Show RMS band',
-        keys: this.keysFor('RMS band', 'wave'),
+        keys: this.keysFor('RMS band'),
         get: () => w.showRms,
         set: (v) => {
           w.showRms = v
@@ -1172,7 +1222,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Split channels into lanes',
-        keys: this.keysFor('Split channels into lanes', 'wave'),
+        keys: this.keysFor('Split channels into lanes'),
         get: () => w.splitChannels,
         set: (v) => {
           w.splitChannels = v
@@ -1188,7 +1238,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Logarithmic frequency',
-        keys: this.keysFor('Logarithmic frequency axis', 'spectrum'),
+        keys: this.keysFor('Logarithmic frequency axis'),
         get: () => s.logFrequency,
         set: (v) => {
           s.logFrequency = v
@@ -1259,7 +1309,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Curve source',
-        keys: this.keysFor('Curve source', 'spectrum'),
+        keys: this.keysFor('Curve source'),
         options: [
           { value: 'live', label: 'Instantaneous' },
           { value: 'average', label: 'Averaged' },
@@ -1273,7 +1323,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Peak hold trace',
-        keys: this.keysFor('Peak hold trace', 'spectrum'),
+        keys: this.keysFor('Peak hold trace'),
         get: () => s.showPeak,
         set: (v) => {
           s.showPeak = v
@@ -1282,7 +1332,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Fill opacity',
-        keys: this.keysFor('Fill opacity', 'spectrum'),
+        keys: this.keysFor('Fill opacity'),
         min: 0,
         max: 1,
         step: 0.01,
@@ -1295,7 +1345,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Split channels into lanes',
-        keys: this.keysFor('Split channels into lanes', 'spectrum'),
+        keys: this.keysFor('Split channels into lanes'),
         get: () => s.splitChannels,
         set: (v) => {
           s.splitChannels = v
@@ -1315,7 +1365,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Time span',
-        keys: this.keysFor('History span', 'spectrogram'),
+        keys: this.keysFor('History span'),
         min: 1,
         max: 120,
         step: 0.5,
@@ -1331,7 +1381,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Logarithmic frequency',
-        keys: this.keysFor('Logarithmic frequency axis', 'spectrogram'),
+        keys: this.keysFor('Logarithmic frequency axis'),
         get: () => s.logFrequency,
         set: (v) => {
           s.logFrequency = v
@@ -1414,7 +1464,7 @@ export class Overlay {
       {
         kind: 'slider',
         label: 'Splat radius',
-        keys: this.keysFor('Splat radius', 'spectrogram'),
+        keys: this.keysFor('Splat radius'),
         min: 0.5,
         max: 4,
         step: 0.05,
@@ -1428,7 +1478,7 @@ export class Overlay {
       {
         kind: 'toggle',
         label: 'Normalise by coverage',
-        keys: this.keysFor('Normalise by coverage', 'spectrogram'),
+        keys: this.keysFor('Normalise by coverage'),
         get: () => s.normalise,
         set: (v) => {
           s.normalise = v
@@ -1438,7 +1488,7 @@ export class Overlay {
       {
         kind: 'select',
         label: 'Palette',
-        keys: this.keysFor('Colour map', 'spectrogram'),
+        keys: this.keysFor('Colour map'),
         options: PALETTES.map((p) => ({ value: p.id, label: p.label })),
         get: () => s.palette,
         set: (v) => {
@@ -1969,6 +2019,26 @@ export class Overlay {
     const status = this.deps.status()
     const e = status.engine
     return [
+      { kind: 'heading', text: 'Panes' },
+      ...PANE_SPECS.map((spec, index) => ({
+        kind: 'toggle' as const,
+        label: spec.label,
+        keys: [String(index + 1)],
+        get: () => c.panes[spec.mode],
+        set: (v: boolean) => {
+          c.panes[spec.mode] = v
+        },
+        // The last one open cannot be closed: an analyzer showing nothing is not a state worth
+        // being able to reach.
+        disabled: () => c.panes[spec.mode] && enabledCount(c.panes) <= 1,
+      })),
+      {
+        kind: 'button',
+        label: 'Reset the pane layout',
+        action: 'reset-layout',
+        onClick: () => this.resetSplit(),
+        hint: 'Four equal quarters. The dividers between panes are dragged by the handle at their intersection, which appears when the pointer is over it.',
+      },
       { kind: 'heading', text: 'Display' },
       {
         kind: 'toggle',

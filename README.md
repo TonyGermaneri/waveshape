@@ -18,16 +18,12 @@ Requires WebGPU: Chrome/Edge 113+, Safari 26+, Firefox 141+.
 Four visualisations, one capture and transform core, all on screen at once:
 
 ```
-        ┌───────────────────┬───────────────────┐
-        │                   │                   │
-        │     Waveform      │     Spectrum      │
-        │                   │                   │
-        ├───────────────────◉───────────────────┤
-        │                   │                   │
-        │    Spectrogram    │    Vectorscope    │
-        │                   │                   │
-        └───────────────────┴───────────────────┘
-                 drag the centre to resize
+   ┌─────────┬─────────┐   ┌─────────┬─────────┐   ┌───────────────────┐
+   │ Wavefm  │ Spectrm │   │ Wavefm  │ Spectrm │   │                   │
+   ├─────────◉─────────┤   ├─────────┴────◉────┤   │      Waveform     │
+   │ Spectgm │ Vectors │   │     Vectorscope   │   │                   │
+   └─────────┴─────────┘   └───────────────────┘   └───────────────────┘
+          four                     three                     one
 ```
 
 | Pane | What it shows |
@@ -37,12 +33,21 @@ Four visualisations, one capture and transform core, all on screen at once:
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
 | **Vectorscope** | Mid/side goniometer with phase correlation. |
 
-The cross that divides them has one degree of freedom per axis, so the four panes always tile
-the viewport exactly. Push it against a rail and two of them collapse to nothing; push it into a
-corner and one fills the screen. **Collapsing is the off switch** — a pane with no room to draw
-in is skipped by the renderer *and* by the analyzer, so closing both spectral panes stops the
-FFT chain running at all. Its position is remembered between sessions, and ↺ in the panel header
-puts it back in the middle.
+`1`–`4` switch a visualisation on and off, and the grid collapses around whatever is left by
+one rule applied twice: **a row with no panes takes no height, and a row with one pane gives it
+the full width.** Three panes therefore leave one spanning the width; two side by side split a
+row; two stacked, or two diagonal, become halves of the screen; one fills it. Nothing here is a
+special case — they all fall out of the same two lines.
+
+The cross that divides the panes has one degree of freedom per axis, so they always tile the
+viewport exactly. Its handle is invisible until the pointer is over it — a permanent disc in the
+middle of the picture is a permanent blemish on the thing being measured — and it grows when the
+split is parked in a corner, where it would otherwise be sharing its pixels with the window
+manager's own resize grip. With a single pane there is no divider left to move and the handle is
+taken away entirely. Dragging a divider to its rail collapses a pane without switching it off,
+and a pane with no room to draw in is skipped by the analyzer as well as the renderer — closing
+both spectral panes stops the FFT chain running at all. The split is remembered between
+sessions; ↺ in the panel header puts it back in the middle.
 
 Capture starts on its own — there is no button to find before the first trace appears. Press
 `space`, `esc` or `h` to toggle the overlay, `f` for full screen, `?` for the keyboard
@@ -52,39 +57,38 @@ reference. Transport (▶ / ❚❚ / ↺) sits at the top of the panel, on `r` a
 
 ## Controls
 
-The scheme is **arrows shape the picture, letters drive the machine**. Arrow keys are
-contextual — gain and time span in the oscilloscope, level window and frequency range in the
-spectrum and spectrogram — while the letter and punctuation pairs adjust the transform and the
-look identically in every mode. Every pair is physically adjacent, left decreasing and right
-increasing.
+**Every key means one thing, everywhere.** All four visualisations are on screen at once, so a
+binding that depended on which one was "focused" would be a binding you had to aim before you
+could use it — and aiming is a step that exists only to work around an ambiguity. Where two
+panes share a concept the key moves both: the frequency keys pan the spectrum and the
+spectrogram together, because both have a frequency axis and neither is the one you meant.
+
+Pairs are physically adjacent, left decreasing and right increasing. Shift on a pair reaches the
+related quantity — `o` `p` is the oscilloscope's span, `⇧O` `⇧P` the spectrogram's.
 
 | | |
 | --- | --- |
 | `space` `esc` `h` | Show or hide the control panel |
-| `f` | Full screen |
-| `?` `F1` | Keyboard reference |
-| `` ` `` `~` | Next / previous panel tab |
-| `1` `2` `3` `4` | Focus a pane — all four are visible, so this only aims the contextual keys |
-| `-` `=` | FFT size |
-| `[` `]` | Hop size |
-| `q` `w` | Window function |
-| `a` `s` | Averaging |
+| `f` · `?` `F1` · `` ` `` `~` | Full screen · keyboard reference · next / previous tab |
+| `1` `2` `3` `4` · `\` | Switch a visualisation on or off · reset the layout |
+| `-` `=` · `[` `]` · `q` `w` · `a` `s` | FFT size · hop · window · averaging |
 | `c` `e` `m` | Channels analysed · reassignment · magnitude scale |
-| `↑` `↓` | Vertical gain, or the level window in the spectral modes |
-| `←` `→` | Time span, or the frequency range |
-| `⇧←` `⇧→` | Zoom the frequency range (clarity threshold in the oscilloscope) |
-| `⇧↑` `⇧↓` | Dynamic range (trigger level in the oscilloscope) |
-| `d` `j` `k` `v` `o` `p` | Per-mode display switches — see the reference |
+| `↑` `↓` | Vertical gain (oscilloscope and vectorscope) |
+| `⇧↑` `⇧↓` | Level window — spectrum and spectrogram together |
+| `←` `→` · `⇧←` `⇧→` | Pan · zoom the frequency range, both panes together |
+| `o` `p` · `⇧O` `⇧P` | Oscilloscope span · spectrogram span |
+| `j` `k` | Split channels · logarithmic frequency axis, wherever they apply |
+| `v` `⇧V` · `d` `⇧D` · `n` `⇧N` | Peak hold · RMS band, trigger · curve source, colour map |
 | `t` `⇧T` | Next / previous theme |
 | `z` `x` · `.` `/` · `;` `'` · `<` `>` · `9` `0` | Persistence · exposure · bloom · intensity · line width |
-| `b` `g` `l` `y` | Tone curve · graticule · axis labels · readout bar |
-| `r` `⇧R` `n` `u` `i` | Restart · stop · reset loudness · monitor gain |
+| `b` `g` `l` `y` | Tone curve · graticule · labels · readout bar |
+| `r` `⇧R` · `⇧M` · `u` `i` | Restart · stop capture, reset loudness, monitor gain |
 
 The reference dialog, the dispatcher and the key caps printed beside each control are all
 generated from one table in `ui/keymap.ts`, so a binding cannot exist without being documented.
-Bindings that belong to another mode are shown dimmed rather than hidden, because "why does `↑`
-do something different here" is the question the dialog exists to answer. Shortcuts are ignored
-while a control has focus, so a slider still takes the arrow keys.
+`keymap.test.ts` proves no two of them answer to the same keystroke, and that the whole table is
+live at once — the property that makes focus unnecessary. Shortcuts are ignored while a control
+has focus, so a slider still takes the arrow keys.
 
 ---
 
@@ -150,6 +154,11 @@ arithmetic.
 ---
 
 ## Decisions worth explaining
+
+**The layout is derived, never stored.** There is no per-pane geometry in the profile — only
+which panes are on and where the cross sits. Every rectangle is recomputed from those two facts
+each frame, which is why switching a pane off and on again lands it back exactly where it was,
+and why there is no state that can disagree with what is on screen.
 
 **Four panes, four viewports, one uniform buffer with four slots.** Every shader works in
 pixels and converts with `toNdc`, so handing one the *pane's* resolution and then pointing the

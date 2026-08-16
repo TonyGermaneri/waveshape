@@ -5,12 +5,17 @@
  * hints printed next to the controls. There is no second list of shortcuts to fall out of date,
  * and `keymap.test.ts` proves no two bindings can be reachable from the same keystroke at once.
  *
- * The scheme is: **arrows shape the picture, letters drive the machine.** Arrow keys are
- * contextual — they mean gain and time span in the oscilloscope, level window and frequency
- * range in the spectrum and spectrogram — while the letter and punctuation pairs adjust the
- * transform and the look identically in every mode. Pairs are laid out so the left key of each
- * physical pair decreases and the right key increases: `-` `=`, `[` `]`, `q` `w`, `a` `s`,
- * `z` `x`, `.` `/`, `;` `'`, `9` `0`.
+ * Every key means one thing, everywhere. All four visualisations are on screen at once, so a
+ * binding that depended on which one had "focus" would be a binding you had to aim before you
+ * could use — and aiming is a step that exists only to work around an ambiguity. Where two
+ * panes share a concept the key moves both of them: the frequency keys pan the spectrum and the
+ * spectrogram together, because both have a frequency axis and there is no sense in which one
+ * of them is the one you meant.
+ *
+ * Pairs are laid out so the left key of each physical pair decreases and the right key
+ * increases: `-` `=`, `[` `]`, `q` `w`, `a` `s`, `o` `p`, `z` `x`, `.` `/`, `;` `'`, `9` `0`.
+ * Shift on a pair reaches the related quantity — `o` `p` is the oscilloscope's span, `⇧O` `⇧P`
+ * the spectrogram's.
  */
 
 import { FFT_SIZES, type Config, type Mode } from '../config.ts'
@@ -20,7 +25,7 @@ import { fmt } from './widgets.ts'
 
 export const KEY_GROUPS = [
   'Panel',
-  'Focus',
+  'Panes',
   'Analysis',
   'Display',
   'Appearance',
@@ -39,6 +44,7 @@ export interface KeyActions {
   restartSource(): void
   stopSource(): void
   resetMeters(): void
+  resetLayout(): void
   notify(text: string): void
   /** Called after a binding ran. `structural` means the set of visible controls may have changed. */
   changed(structural: boolean): void
@@ -61,9 +67,8 @@ export interface Binding {
   keys: readonly KeyStroke[]
   label: string
   group: KeyGroup
-  /** Modes this binding is live in. Absent means every mode. */
-  modes?: readonly Mode[]
   detail?: string
+  /** Live only in some states — never "only in some pane", which is the thing focus was for. */
   when?: (c: Config) => boolean
   structural?: boolean
   /** Returns the text to flash on screen, or nothing to stay silent. */
@@ -93,7 +98,6 @@ interface NumberBinding {
   keys: readonly KeyStroke[]
   label: string
   group: KeyGroup
-  modes?: readonly Mode[]
   detail?: string
   when?: (c: Config) => boolean
   get: (c: Config) => number
@@ -112,7 +116,6 @@ function number_(spec: NumberBinding): Binding {
     keys: spec.keys,
     label: spec.label,
     group: spec.group,
-    modes: spec.modes,
     detail: spec.detail,
     when: spec.when,
     run: (ctx, arg) => {
@@ -131,7 +134,6 @@ interface ChoiceBinding<T extends string | number> {
   keys: readonly KeyStroke[]
   label: string
   group: KeyGroup
-  modes?: readonly Mode[]
   detail?: string
   when?: (c: Config) => boolean
   values: readonly T[]
@@ -145,7 +147,6 @@ function choice<T extends string | number>(spec: ChoiceBinding<T>): Binding {
     keys: spec.keys,
     label: spec.label,
     group: spec.group,
-    modes: spec.modes,
     detail: spec.detail,
     when: spec.when,
     structural: true,
@@ -162,7 +163,6 @@ interface FlagBinding {
   key: string
   label: string
   group: KeyGroup
-  modes?: readonly Mode[]
   detail?: string
   when?: (c: Config) => boolean
   get: (c: Config) => boolean
@@ -174,7 +174,6 @@ function flag(spec: FlagBinding): Binding {
     keys: one(spec.key),
     label: spec.label,
     group: spec.group,
-    modes: spec.modes,
     detail: spec.detail,
     when: spec.when,
     structural: true,
@@ -251,9 +250,8 @@ const MODE_LABELS: Record<Mode, string> = {
   vector: 'Vectorscope',
 }
 
-const WAVE_ONLY: readonly Mode[] = ['wave']
-const SPECTRUM_ONLY: readonly Mode[] = ['spectrum']
-const SPECTROGRAM_ONLY: readonly Mode[] = ['spectrogram']
+/** Prints one value when both panes agree, and both when they have been pulled apart. */
+const agree = (a: string, b: string): string => (a === b ? a : `${a}  ·  ${b}`)
 
 export const BINDINGS: readonly Binding[] = [
   // ------------------------------------------------------------------------------ panel
@@ -295,17 +293,33 @@ export const BINDINGS: readonly Binding[] = [
     run: (ctx, arg) => `Tab  ${ctx.actions.cycleTab(arg)}`,
   },
 
-  // ------------------------------------------------------------------------------ focus
+  // ------------------------------------------------------------------------------ panes
   {
     keys: MODES.map((_, i) => ({ token: String(i + 1), arg: i })),
-    label: 'Focus waveform · spectrum · spectrogram · vectorscope',
-    group: 'Focus',
+    label: 'Switch a visualisation on or off',
+    group: 'Panes',
     detail:
-      'All four panes are on screen at once, so this aims the contextual keys below rather than switching anything. The focused pane is the one whose name is highlighted.',
+      'The grid collapses around whatever is left: three panes leave one spanning the width, two become halves, one fills the screen.',
     structural: true,
     run: (ctx, arg) => {
-      ctx.config.mode = MODES[arg]
-      return `Focus  ${MODE_LABELS[MODES[arg]]}`
+      const mode = MODES[arg]
+      const panes = ctx.config.panes
+      const next = !panes[mode]
+      // Switching off the last one would leave an analyzer with nothing to look at.
+      if (!next && MODES.filter((m) => panes[m]).length <= 1) {
+        return `${MODE_LABELS[mode]} is the last pane open`
+      }
+      panes[mode] = next
+      return `${MODE_LABELS[mode]}  ${next ? 'on' : 'off'}`
+    },
+  },
+  {
+    keys: one('\\'),
+    label: 'Reset the pane layout',
+    group: 'Panes',
+    structural: true,
+    run: (ctx) => {
+      ctx.actions.resetLayout()
     },
   },
 
@@ -380,7 +394,7 @@ export const BINDINGS: readonly Binding[] = [
     },
   }),
   choice({
-    keys: cycleKeys('m'),
+    keys: one('m'),
     label: 'Magnitude scale',
     group: 'Analysis',
     values: ['amplitude', 'density'] as const,
@@ -391,7 +405,10 @@ export const BINDINGS: readonly Binding[] = [
     },
   }),
 
-  // ------------------------------------------------------------------------------ display: waveform
+  // ------------------------------------------------------------------------------ display
+  //
+  // Nothing here asks which pane you meant. Where a control belongs to one visualisation it has
+  // a key of its own; where two of them share an axis, one key moves both.
   number_({
     keys: [
       { token: 'arrowup', arg: 1 },
@@ -399,7 +416,7 @@ export const BINDINGS: readonly Binding[] = [
     ],
     label: 'Vertical gain',
     group: 'Display',
-    modes: ['wave', 'vector'],
+    detail: 'Drives the oscilloscope and the vectorscope, which share one gain.',
     get: (c) => c.wave.gain,
     set: (c, v) => {
       c.wave.gain = v
@@ -409,276 +426,63 @@ export const BINDINGS: readonly Binding[] = [
     factor: 1.15,
     format: (v) => `${v.toFixed(2)}×  (${(20 * Math.log10(v)).toFixed(1)} dB)`,
   }),
-  number_({
+  {
     keys: [
       { token: 'shift+arrowup', arg: 1 },
       { token: 'shift+arrowdown', arg: -1 },
-    ],
-    label: 'Trigger level',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    when: (c) => c.wave.trigger !== 'free',
-    get: (c) => c.wave.triggerLevel,
-    set: (c, v) => {
-      c.wave.triggerLevel = v
-    },
-    min: -1,
-    max: 1,
-    step: 0.02,
-    format: fmt.fixed(3),
-  }),
-  number_({
-    keys: pair('arrowleft', 'arrowright'),
-    label: 'Time span',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    when: (c) => c.wave.trigger !== 'pitch',
-    get: (c) => c.wave.timebaseMs,
-    set: (c, v) => {
-      c.wave.timebaseMs = v
-    },
-    min: 0.05,
-    max: 5000,
-    factor: 1.25,
-    format: fmt.ms,
-  }),
-  number_({
-    keys: pair('arrowleft', 'arrowright'),
-    label: 'Cycles shown',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    when: (c) => c.wave.trigger === 'pitch',
-    detail: 'While pitch-locked the span is a whole number of detected periods, not a duration.',
-    get: (c) => c.wave.cycles,
-    set: (c, v) => {
-      c.wave.cycles = Math.round(v * 4) / 4
-    },
-    min: 0.25,
-    max: 32,
-    step: 0.25,
-    format: (v) => `${v} periods`,
-  }),
-  number_({
-    keys: pair('shift+arrowleft', 'shift+arrowright'),
-    label: 'Clarity threshold',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    when: (c) => c.wave.trigger === 'pitch',
-    get: (c) => c.wave.clarityThreshold,
-    set: (c, v) => {
-      c.wave.clarityThreshold = v
-    },
-    min: 0,
-    max: 1,
-    step: 0.02,
-    format: fmt.fixed(2),
-  }),
-  choice({
-    keys: cycleKeys('d'),
-    label: 'Trigger',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    values: ['pitch', 'level', 'free'] as const,
-    labels: ['Pitch-locked', 'Level', 'Free run'],
-    get: (c) => c.wave.trigger,
-    set: (c, v) => {
-      c.wave.trigger = v
-    },
-  }),
-  flag({
-    key: 'v',
-    label: 'RMS band',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    get: (c) => c.wave.showRms,
-    set: (c, v) => {
-      c.wave.showRms = v
-    },
-  }),
-  flag({
-    key: 'j',
-    label: 'Split channels into lanes',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    get: (c) => c.wave.splitChannels,
-    set: (c, v) => {
-      c.wave.splitChannels = v
-    },
-  }),
-  choice({
-    keys: cycleKeys('k'),
-    label: 'Reconstruction',
-    group: 'Display',
-    modes: WAVE_ONLY,
-    values: ['auto', 'envelope', 'bandlimited'] as const,
-    labels: ['Automatic', 'Min/max envelope', 'Band-limited'],
-    get: (c) => c.wave.trace,
-    set: (c, v) => {
-      c.wave.trace = v
-    },
-  }),
-
-  // ------------------------------------------------------------------------------ display: spectrum
-  {
-    keys: [
-      { token: 'arrowup', arg: 1 },
-      { token: 'arrowdown', arg: -1 },
     ],
     label: 'Level window',
     group: 'Display',
-    modes: SPECTRUM_ONLY,
-    detail: 'Slides floor and ceiling together, 2 dB at a time.',
+    detail: 'Slides floor and ceiling together, 2 dB at a time, in the spectrum and the spectrogram.',
     run: (ctx, arg) => {
       const s = ctx.config.spectrum
-      const range = { lo: s.dbMin, hi: s.dbMax }
-      const text = shiftDb(range, arg, -200, 40)
-      s.dbMin = range.lo
-      s.dbMax = range.hi
-      return `Level window  ${text}`
+      const g = ctx.config.spectrogram
+      const a = { lo: s.dbMin, hi: s.dbMax }
+      const b = { lo: g.dbFloor, hi: g.dbCeil }
+      const textA = shiftDb(a, arg, -200, 40)
+      const textB = shiftDb(b, arg, -160, 20)
+      s.dbMin = a.lo
+      s.dbMax = a.hi
+      g.dbFloor = b.lo
+      g.dbCeil = b.hi
+      return `Level window  ${agree(textA, textB)}`
     },
   },
-  number_({
-    keys: [
-      { token: 'shift+arrowup', arg: 1 },
-      { token: 'shift+arrowdown', arg: -1 },
-    ],
-    label: 'Dynamic range',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    get: (c) => c.spectrum.dbMax - c.spectrum.dbMin,
-    set: (c, v) => {
-      c.spectrum.dbMin = c.spectrum.dbMax - v
-    },
-    min: 10,
-    max: 200,
-    step: 5,
-    format: (v) => `${v.toFixed(0)} dB`,
-  }),
   {
     keys: pair('arrowleft', 'arrowright'),
-    label: 'Pan frequency range',
+    label: 'Pan the frequency range',
     group: 'Display',
-    modes: SPECTRUM_ONLY,
-    run: (ctx, arg) => `Frequency  ${panFrequency(ctx.config.spectrum, arg)}`,
+    detail: 'Both frequency axes at once — the spectrum and the spectrogram.',
+    run: (ctx, arg) =>
+      `Frequency  ${agree(panFrequency(ctx.config.spectrum, arg), panFrequency(ctx.config.spectrogram, arg))}`,
   },
   {
     keys: pair('shift+arrowleft', 'shift+arrowright'),
-    label: 'Zoom frequency range',
+    label: 'Zoom the frequency range',
     group: 'Display',
-    modes: SPECTRUM_ONLY,
-    run: (ctx, arg) => `Frequency  ${zoomFrequency(ctx.config.spectrum, arg)}`,
+    run: (ctx, arg) =>
+      `Frequency  ${agree(zoomFrequency(ctx.config.spectrum, arg), zoomFrequency(ctx.config.spectrogram, arg))}`,
   },
-  choice({
-    keys: cycleKeys('d'),
-    label: 'Curve source',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    values: ['live', 'average'] as const,
-    labels: ['Instantaneous', 'Averaged'],
-    get: (c) => c.spectrum.source,
-    set: (c, v) => {
-      c.spectrum.source = v
-    },
-  }),
-  flag({
-    key: 'v',
-    label: 'Peak hold trace',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    get: (c) => c.spectrum.showPeak,
-    set: (c, v) => {
-      c.spectrum.showPeak = v
-    },
-  }),
-  flag({
-    key: 'j',
-    label: 'Split channels into lanes',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    get: (c) => c.spectrum.splitChannels,
-    set: (c, v) => {
-      c.spectrum.splitChannels = v
-    },
-  }),
-  number_({
-    keys: pair('o', 'p'),
-    label: 'Fill opacity',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    get: (c) => c.spectrum.fill,
-    set: (c, v) => {
-      c.spectrum.fill = v
-    },
-    min: 0,
-    max: 1,
-    step: 0.05,
-    format: fmt.pct,
-  }),
-  flag({
-    key: 'k',
-    label: 'Logarithmic frequency axis',
-    group: 'Display',
-    modes: SPECTRUM_ONLY,
-    get: (c) => c.spectrum.logFrequency,
-    set: (c, v) => {
-      c.spectrum.logFrequency = v
-    },
-  }),
-
-  // ------------------------------------------------------------------------------ display: spectrogram
   {
-    keys: [
-      { token: 'arrowup', arg: 1 },
-      { token: 'arrowdown', arg: -1 },
-    ],
-    label: 'Intensity window',
+    keys: pair('o', 'p'),
+    label: 'Oscilloscope span',
     group: 'Display',
-    modes: SPECTROGRAM_ONLY,
+    detail:
+      'Pitch-locked, the span is a whole number of detected periods and this changes how many; otherwise it is a duration and this stretches it.',
     run: (ctx, arg) => {
-      const s = ctx.config.spectrogram
-      const range = { lo: s.dbFloor, hi: s.dbCeil }
-      const text = shiftDb(range, arg, -160, 20)
-      s.dbFloor = range.lo
-      s.dbCeil = range.hi
-      return `Intensity window  ${text}`
+      const w = ctx.config.wave
+      if (w.trigger === 'pitch') {
+        w.cycles = clamp(Math.round((w.cycles + arg * 0.25) * 4) / 4, 0.25, 32)
+        return `Cycles shown  ${w.cycles} periods`
+      }
+      w.timebaseMs = clamp(w.timebaseMs * Math.pow(1.25, arg), 0.05, 5000)
+      return `Time span  ${fmt.ms(w.timebaseMs)}`
     },
   },
   number_({
-    keys: [
-      { token: 'shift+arrowup', arg: 1 },
-      { token: 'shift+arrowdown', arg: -1 },
-    ],
-    label: 'Dynamic range',
+    keys: pair('shift+o', 'shift+p'),
+    label: 'Spectrogram span',
     group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    get: (c) => c.spectrogram.dbCeil - c.spectrogram.dbFloor,
-    set: (c, v) => {
-      c.spectrogram.dbFloor = c.spectrogram.dbCeil - v
-    },
-    min: 10,
-    max: 160,
-    step: 5,
-    format: (v) => `${v.toFixed(0)} dB`,
-  }),
-  {
-    keys: pair('arrowleft', 'arrowright'),
-    label: 'Pan frequency range',
-    group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    run: (ctx, arg) => `Frequency  ${panFrequency(ctx.config.spectrogram, arg)}`,
-  },
-  {
-    keys: pair('shift+arrowleft', 'shift+arrowright'),
-    label: 'Zoom frequency range',
-    group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    run: (ctx, arg) => `Frequency  ${zoomFrequency(ctx.config.spectrogram, arg)}`,
-  },
-  number_({
-    keys: pair('o', 'p'),
-    label: 'History span',
-    group: 'Display',
-    modes: SPECTROGRAM_ONLY,
     get: (c) => c.spectrogram.historySeconds,
     set: (c, v) => {
       c.spectrogram.historySeconds = Math.round(v * 2) / 2
@@ -688,45 +492,75 @@ export const BINDINGS: readonly Binding[] = [
     factor: 1.25,
     format: (v) => `${v.toFixed(1)} s`,
   }),
-  number_({
-    keys: pair('d', 'shift+d'),
-    label: 'Splat radius',
-    group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    get: (c) => c.spectrogram.splatRadius,
-    set: (c, v) => {
-      c.spectrogram.splatRadius = v
-    },
-    min: 0.5,
-    max: 4,
-    step: 0.05,
-    format: (v) => `${v.toFixed(2)} px`,
-  }),
-  flag({
-    key: 'v',
-    label: 'Normalise by coverage',
-    group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    get: (c) => c.spectrogram.normalise,
-    set: (c, v) => {
-      c.spectrogram.normalise = v
-    },
-  }),
-  flag({
-    key: 'k',
+  {
+    keys: one('k'),
     label: 'Logarithmic frequency axis',
     group: 'Display',
-    modes: SPECTROGRAM_ONLY,
-    get: (c) => c.spectrogram.logFrequency,
+    structural: true,
+    run: (ctx) => {
+      // One key, one state: if they had drifted apart, this brings them together.
+      const next = !ctx.config.spectrum.logFrequency
+      ctx.config.spectrum.logFrequency = next
+      ctx.config.spectrogram.logFrequency = next
+      return `Logarithmic frequency axis  ${next ? 'on' : 'off'}`
+    },
+  },
+  {
+    keys: one('j'),
+    label: 'Split channels into lanes',
+    group: 'Display',
+    structural: true,
+    run: (ctx) => {
+      const next = !ctx.config.wave.splitChannels
+      ctx.config.wave.splitChannels = next
+      ctx.config.spectrum.splitChannels = next
+      return `Split channels into lanes  ${next ? 'on' : 'off'}`
+    },
+  },
+  flag({
+    key: 'v',
+    label: 'Peak hold trace',
+    group: 'Display',
+    get: (c) => c.spectrum.showPeak,
     set: (c, v) => {
-      c.spectrogram.logFrequency = v
+      c.spectrum.showPeak = v
+    },
+  }),
+  flag({
+    key: 'shift+v',
+    label: 'RMS band',
+    group: 'Display',
+    get: (c) => c.wave.showRms,
+    set: (c, v) => {
+      c.wave.showRms = v
     },
   }),
   choice({
-    keys: cycleKeys('j'),
-    label: 'Colour map',
+    keys: one('d'),
+    label: 'Trigger',
     group: 'Display',
-    modes: SPECTROGRAM_ONLY,
+    values: ['pitch', 'level', 'free'] as const,
+    labels: ['Pitch-locked', 'Level', 'Free run'],
+    get: (c) => c.wave.trigger,
+    set: (c, v) => {
+      c.wave.trigger = v
+    },
+  }),
+  choice({
+    keys: one('shift+d'),
+    label: 'Spectrum curve source',
+    group: 'Display',
+    values: ['live', 'average'] as const,
+    labels: ['Instantaneous', 'Averaged'],
+    get: (c) => c.spectrum.source,
+    set: (c, v) => {
+      c.spectrum.source = v
+    },
+  }),
+  choice({
+    keys: cycleKeys('n'),
+    label: 'Spectrogram colour map',
+    group: 'Display',
     values: PALETTES.map((p) => p.id),
     labels: PALETTES.map((p) => p.label),
     get: (c) => c.spectrogram.palette,
@@ -830,7 +664,7 @@ export const BINDINGS: readonly Binding[] = [
   }),
   flag({
     key: 'l',
-    label: 'Axis labels',
+    label: 'Axis and pane labels',
     group: 'Appearance',
     get: (c) => c.style.showLabels,
     set: (c, v) => {
@@ -867,7 +701,7 @@ export const BINDINGS: readonly Binding[] = [
     },
   },
   {
-    keys: one('n'),
+    keys: one('shift+m'),
     label: 'Reset loudness integration',
     group: 'Source',
     run: (ctx) => {
@@ -913,9 +747,7 @@ export function keyToken(event: KeyboardEvent): string {
 }
 
 export function bindingsFor(config: Config): Binding[] {
-  return BINDINGS.filter(
-    (b) => (!b.modes || b.modes.includes(config.mode)) && (!b.when || b.when(config)),
-  )
+  return BINDINGS.filter((b) => !b.when || b.when(config))
 }
 
 /** Runs the binding this keystroke selects, if any. Returns true when the event was consumed. */
@@ -957,12 +789,6 @@ export function keyLabel(token: string): string {
     .join('')
   const glyph = GLYPHS[base] ?? (base.length === 1 ? base.toUpperCase() : base)
   return prefix + glyph
-}
-
-/** The scope tag shown in the reference, e.g. "waveform only". */
-export function bindingScope(binding: Binding): string {
-  if (!binding.modes || binding.modes.length === MODES.length) return ''
-  return binding.modes.map((m) => MODE_LABELS[m].toLowerCase()).join(' · ')
 }
 
 export { MODE_LABELS }

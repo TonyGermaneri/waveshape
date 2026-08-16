@@ -2,24 +2,16 @@
  * The keyboard reference.
  *
  * Generated from the same table the dispatcher runs, so a binding cannot exist without being
- * documented and cannot be documented without existing. Bindings that are not live in the
- * current mode are shown dimmed with the mode they belong to rather than hidden, because "why
- * does ↑ do something different here" is exactly the question this dialog exists to answer.
+ * documented and cannot be documented without existing. Every key means one thing everywhere,
+ * so there is nothing here to qualify — a binding is dimmed only when the state it needs is not
+ * the current one.
  *
  * A native `<dialog>` carries the modal semantics, the focus trap, the backdrop and Escape
  * handling; none of that is worth reimplementing.
  */
 
 import type { Config } from '../config.ts'
-import {
-  BINDINGS,
-  KEY_GROUPS,
-  MODE_LABELS,
-  bindingScope,
-  keyLabel,
-  type Binding,
-  type KeyGroup,
-} from './keymap.ts'
+import { BINDINGS, KEY_GROUPS, bindingsFor, keyLabel, type Binding } from './keymap.ts'
 
 export class KeyHelp {
   private readonly dialog: HTMLDialogElement
@@ -113,7 +105,6 @@ export class KeyHelp {
       binding.label,
       binding.detail ?? '',
       binding.group,
-      bindingScope(binding),
       binding.keys.map((k) => `${k.token} ${keyLabel(k.token)}`).join(' '),
     ]
       .join(' ')
@@ -122,8 +113,7 @@ export class KeyHelp {
   }
 
   private active(binding: Binding): boolean {
-    if (binding.modes && !binding.modes.includes(this.config.mode)) return false
-    return !binding.when || binding.when(this.config)
+    return bindingsFor(this.config).includes(binding)
   }
 
   private render(): void {
@@ -133,15 +123,12 @@ export class KeyHelp {
     for (const group of KEY_GROUPS) {
       const bindings = BINDINGS.filter((b) => b.group === group && this.matches(b))
       if (bindings.length === 0) continue
-      // Live bindings first: in the spectrogram, the spectrogram meaning of ↑ should be the one
-      // your eye lands on.
-      bindings.sort((a, b) => Number(this.active(b)) - Number(this.active(a)))
 
       const section = document.createElement('section')
       section.className = 'ws-keygroup'
       const heading = document.createElement('h3')
       heading.className = 'ws-heading'
-      heading.textContent = this.groupTitle(group)
+      heading.textContent = group
       section.append(heading)
 
       for (const binding of bindings) {
@@ -157,10 +144,6 @@ export class KeyHelp {
       empty.textContent = `Nothing matches “${this.filterInput.value}”.`
       this.list.append(empty)
     }
-  }
-
-  private groupTitle(group: KeyGroup): string {
-    return group === 'Display' ? `Display  ·  ${MODE_LABELS[this.config.mode]}` : group
   }
 
   private row(binding: Binding): HTMLElement {
@@ -184,13 +167,6 @@ export class KeyHelp {
     label.textContent = binding.label
     text.append(label)
 
-    const scope = bindingScope(binding)
-    if (scope) {
-      const tag = document.createElement('span')
-      tag.className = 'ws-keyscope'
-      tag.textContent = scope
-      text.append(tag)
-    }
     if (binding.detail) {
       const detail = document.createElement('p')
       detail.className = 'ws-hint'
