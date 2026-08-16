@@ -5,7 +5,17 @@
     <link rel="icon" type="image/svg+xml" href="./public/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Real-time audio waveform and spectral analysis on WebGPU compute shaders."
+    />
     <title>Waveshape</title>
+    <!--
+      Restores cross-origin isolation (and therefore SharedArrayBuffer) on static hosts that
+      cannot set COOP/COEP headers, such as GitHub Pages. No-ops when the server already sends
+      them. Must run before the module so the reload happens before any audio work starts.
+    -->
+    <script src="./coi-serviceworker.js"></script>
   </head>
   <body>
     <canvas id="stage"></canvas>

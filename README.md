@@ -173,19 +173,40 @@ The reassigned estimate resolves to a small fraction of a hertz against an 11.72
 
 ---
 
-## Cross-origin isolation
+## Deploying
+
+`.github/workflows/deploy.yml` builds and publishes to GitHub Pages on every push to `main`.
+It runs the DSP tests and `tsc --noEmit` first, so a numerical regression or a type error fails
+the deploy rather than shipping.
+
+Enable it under **Settings ▸ Pages ▸ Source ▸ GitHub Actions**. `vite.config.ts` uses a
+relative `base`, so the build works at any subpath without configuration.
+
+### Cross-origin isolation
 
 The lock-free ring needs `SharedArrayBuffer`, which is only exposed to cross-origin-isolated
-documents. The dev and preview servers already send the required headers:
+documents, and isolation requires two response headers:
 
 ```
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-Serve the production build the same way. Without them the app still runs — the capture path
-degrades to a pooled `postMessage` transfer, and the System tab says so — but the audio thread
-is no longer allocation-free.
+The dev and preview servers set them directly. **GitHub Pages cannot set response headers at
+all**, so `public/coi-serviceworker.js` supplies them from a service worker instead: it sits in
+front of every same-origin request and re-issues the response with the headers attached. The
+first load is not yet isolated, so it registers, reloads once, and comes back isolated. It
+no-ops when the server already sends the headers, and it is guarded against reload loops.
+
+Verified against a static server sending no headers at all, at a `/waveshape/` subpath:
+
+```
+crossOriginIsolated: true    SharedArrayBuffer: available
+System ▸ Shared memory: "SharedArrayBuffer ring (lock-free)"
+```
+
+Without any of this the app still runs — the capture path degrades to a pooled `postMessage`
+transfer and the System tab says so — but the audio thread is no longer allocation-free.
 
 ---
 
