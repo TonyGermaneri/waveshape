@@ -1,0 +1,584 @@
+/*
+ * The canvas owns the viewport. Everything else floats above it and is dismissable, so the
+ * waveform is never cropped to make room for chrome.
+ */
+
+:root {
+  --ws-panel: rgba(14, 15, 18, 0.82);
+  --ws-panel-solid: #0e0f12;
+  --ws-line: rgba(255, 255, 255, 0.1);
+  --ws-line-strong: rgba(255, 255, 255, 0.2);
+  --ws-text: rgba(255, 255, 255, 0.92);
+  --ws-muted: rgba(255, 255, 255, 0.52);
+  --ws-faint: rgba(255, 255, 255, 0.34);
+  --ws-accent: #4bb4ff;
+  --ws-radius: 10px;
+  --ws-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --ws-sans: system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  color: var(--ws-text);
+  font-family: var(--ws-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+#ui {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+#ui > * {
+  pointer-events: auto;
+}
+
+/* ---------------------------------------------------------------- axis labels */
+
+.ws-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  font-family: var(--ws-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--ws-faint);
+}
+
+.ws-tick {
+  position: absolute;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.34);
+  white-space: nowrap;
+  transform: translateY(-50%);
+}
+
+.ws-tick[data-axis='x'] {
+  transform: translate(-50%, 0);
+}
+
+/* ---------------------------------------------------------------- readout bar */
+
+.ws-readout {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  right: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-family: var(--ws-mono);
+  font-size: 11px;
+  color: var(--ws-muted);
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.ws-stat {
+  white-space: nowrap;
+}
+
+.ws-stat em {
+  font-style: normal;
+  color: var(--ws-faint);
+  margin-right: 5px;
+}
+
+/* ---------------------------------------------------------------- toast */
+
+.ws-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translate(-50%, 8px);
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--ws-line);
+  font-family: var(--ws-mono);
+  font-size: 11px;
+  color: var(--ws-muted);
+  opacity: 0;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  pointer-events: none;
+}
+
+.ws-toast-show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* ---------------------------------------------------------------- panel */
+
+.ws-panel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: min(420px, calc(100vw - 24px));
+  display: flex;
+  flex-direction: column;
+  background: var(--ws-panel);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  border: 1px solid var(--ws-line);
+  border-radius: var(--ws-radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.ws-panel.ws-hidden {
+  opacity: 0;
+  transform: translateX(12px);
+  pointer-events: none;
+}
+
+.ws-hidden {
+  display: none;
+}
+
+.ws-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--ws-line);
+}
+
+.ws-title strong {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.ws-title span {
+  display: block;
+  font-size: 10.5px;
+  color: var(--ws-faint);
+  margin-top: 2px;
+}
+
+.ws-close {
+  appearance: none;
+  border: 1px solid var(--ws-line);
+  background: transparent;
+  color: var(--ws-muted);
+  font-family: var(--ws-mono);
+  font-size: 10.5px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.ws-close:hover {
+  color: var(--ws-text);
+  border-color: var(--ws-line-strong);
+}
+
+.ws-modes {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  padding: 10px 12px;
+}
+
+.ws-mode {
+  appearance: none;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ws-muted);
+  border-radius: 7px;
+  padding: 8px 4px 7px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.ws-mode kbd {
+  font-family: var(--ws-mono);
+  font-size: 9px;
+  color: var(--ws-faint);
+  border: 1px solid var(--ws-line);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.ws-mode:hover {
+  color: var(--ws-text);
+}
+
+.ws-mode.ws-active {
+  background: rgba(75, 180, 255, 0.16);
+  border-color: rgba(75, 180, 255, 0.4);
+  color: #dcefff;
+}
+
+.ws-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--ws-line);
+}
+
+.ws-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.ws-tab {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--ws-faint);
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 9px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+
+.ws-tab:hover {
+  color: var(--ws-text);
+}
+
+.ws-tab.ws-active {
+  color: var(--ws-text);
+  border-bottom-color: var(--ws-accent);
+}
+
+.ws-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 16px 24px;
+}
+
+.ws-body::-webkit-scrollbar {
+  width: 9px;
+}
+
+.ws-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.ws-heading {
+  margin: 18px 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ws-faint);
+}
+
+.ws-heading:first-child {
+  margin-top: 2px;
+}
+
+.ws-field {
+  margin-bottom: 12px;
+}
+
+.ws-control {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.ws-field .ws-control {
+  margin-bottom: 3px;
+}
+
+.ws-control-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-control-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.ws-label {
+  font-size: 12px;
+  color: var(--ws-text);
+}
+
+.ws-value {
+  font-family: var(--ws-mono);
+  font-size: 10.5px;
+  color: var(--ws-accent);
+  white-space: nowrap;
+}
+
+.ws-value-wide {
+  margin-left: auto;
+  color: var(--ws-muted);
+}
+
+.ws-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--ws-faint);
+}
+
+.ws-note {
+  margin: 0 0 14px;
+  padding: 9px 11px;
+  border-left: 2px solid var(--ws-line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 0 6px 6px 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ws-muted);
+}
+
+.ws-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ws-row > * {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.ws-select {
+  width: 100%;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--ws-line);
+  border-radius: 6px;
+  color: var(--ws-text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 7px 9px;
+  margin-top: 5px;
+  cursor: pointer;
+}
+
+.ws-select:focus-visible,
+.ws-slider:focus-visible,
+.ws-button:focus-visible,
+.ws-check:focus-visible {
+  outline: 2px solid var(--ws-accent);
+  outline-offset: 2px;
+}
+
+.ws-select option {
+  background: var(--ws-panel-solid);
+}
+
+.ws-slider {
+  width: 100%;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.ws-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.ws-slider::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.ws-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: #eaf4ff;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+}
+
+.ws-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #eaf4ff;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+}
+
+.ws-slider:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.ws-check {
+  appearance: none;
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--ws-line);
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.14s ease;
+}
+
+.ws-check::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #d9dee6;
+  transition: transform 0.14s ease;
+}
+
+.ws-check:checked {
+  background: rgba(75, 180, 255, 0.55);
+  border-color: rgba(75, 180, 255, 0.7);
+}
+
+.ws-check:checked::after {
+  transform: translateX(13px);
+  background: #fff;
+}
+
+.ws-color {
+  appearance: none;
+  width: 30px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--ws-line);
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+  flex: none;
+}
+
+.ws-color::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.ws-color::-webkit-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+.ws-button {
+  width: 100%;
+  appearance: none;
+  border: 1px solid var(--ws-line);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ws-text);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.ws-button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--ws-line-strong);
+}
+
+/* ---------------------------------------------------------------- blocking states */
+
+.ws-blocker {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: #050506;
+  z-index: 20;
+}
+
+.ws-blocker-inner {
+  max-width: 560px;
+  text-align: left;
+}
+
+.ws-blocker h1 {
+  margin: 0 0 10px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.ws-blocker p {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ws-muted);
+}
+
+.ws-blocker code {
+  font-family: var(--ws-mono);
+  font-size: 12px;
+  color: var(--ws-accent);
+}
+
+@media (max-width: 640px) {
+  .ws-panel {
+    top: auto;
+    height: 62vh;
+    width: calc(100vw - 16px);
+    right: 8px;
+    bottom: 8px;
+  }
+
+  .ws-readout {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-panel,
+  .ws-toast,
+  .ws-check,
+  .ws-check::after {
+    transition: none;
+  }
+}
