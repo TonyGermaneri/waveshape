@@ -363,10 +363,27 @@ export class Overlay {
     this.notify(on ? 'Full screen  ·  press f or esc to leave' : 'Full screen off')
   }
 
+  /**
+   * The tabs actually in the bar. Life is only there once it has been asked for.
+   *
+   * `TABS` stays the full list, because it is what the `Tab` type and the MIDI control index are
+   * built from — a binding made against a Life control keeps working whether or not its tab is
+   * currently on show, which is the same rule as a binding on a tab you simply are not looking
+   * at.
+   */
+  private get tabs(): readonly Tab[] {
+    return TABS.filter((tab) => tab !== 'Life' || this.deps.config.showLife)
+  }
+
   /** Moves along the tab bar; returns the tab landed on so a shortcut can announce it. */
   cycleTab(dir: number): string {
-    const index = TABS.indexOf(this.tab)
-    this.tab = TABS[(index + dir + TABS.length) % TABS.length]
+    const tabs = this.tabs
+    const index = tabs.indexOf(this.tab)
+    // Landing on a hidden tab is not possible, but starting on one is: hiding Life while it is
+    // open leaves `this.tab` pointing at something that is no longer in the bar, and an index of
+    // -1 would make one step forward arrive at the first tab and one step back at the last.
+    const from = index < 0 ? 0 : index
+    this.tab = tabs[(from + dir + tabs.length) % tabs.length]
     this.syncTabBar()
     // Reaching for a tab is a request to see it, so the panel comes back if it was dismissed.
     if (this.visible) this.rebuild()
@@ -445,7 +462,7 @@ export class Overlay {
 
   private buildTabBar(): void {
     this.tabBar.replaceChildren()
-    for (const tab of TABS) {
+    for (const tab of this.tabs) {
       const button = document.createElement('button')
       button.type = 'button'
       button.className = 'ws-tab'
@@ -499,6 +516,15 @@ export class Overlay {
     // The bubble is anchored to an element that is about to be replaced, so it would be left
     // pointing at nothing.
     dismissHints()
+    // Revealing or hiding Life changes the bar, and hiding it while it is open would otherwise
+    // leave the panel showing a tab that no longer has a button — reachable by nothing, and
+    // impossible to leave except by cycling past where it used to be.
+    const tabs = this.tabs
+    if (this.tabBar.childElementCount !== tabs.length) this.buildTabBar()
+    if (!tabs.includes(this.tab)) {
+      this.tab = 'System'
+      this.syncTabBar()
+    }
     this.midi.reindex()
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
       this.syncChrome()
@@ -2500,6 +2526,20 @@ export class Overlay {
         action: 'reset-layout',
         onClick: () => this.resetSplit(),
         hint: 'Four equal quarters. The dividers between panes are dragged by the handle at their intersection, which appears when the pointer is over it.',
+      },
+      { kind: 'heading', text: 'Extras' },
+      {
+        kind: 'toggle',
+        label: 'Let there be Life',
+        get: () => c.showLife,
+        set: (v) => {
+          c.showLife = v
+          // Putting the feature away puts the organism away with it. Leaving it running with its
+          // tab gone would mean particles on screen and no way to reach a single knob that
+          // governs them — the one state this switch exists to make impossible.
+          if (!v) c.life.enabled = false
+        },
+        hint: 'Adds the Life tab, where the analyser grows an organism on top of itself: every point the reassignment pass measures becomes a particle that knows what it is harmonically, walks its own harmonic series, and pushes away from anything it is out of tune with. It is a tab of its own because it has more parameters than the analyser does, and most people opening a spectrum analyser did not come for an ecology. Turning it off again stops the organism as well as hiding its tab.',
       },
       { kind: 'heading', text: 'Display' },
       {

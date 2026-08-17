@@ -52,6 +52,15 @@ export interface Config {
   split: LayoutSplit
   /** Id of the theme last applied. Only used to show which entry is current. */
   themeId: string
+  /**
+   * Whether the Life tab is in the panel at all.
+   *
+   * The organism has more parameters than the analyser does, and most people opening a spectrum
+   * analyser did not come for an ecology. It is off by default and revealed from the System tab,
+   * which keeps a tab's worth of knobs out of the way of anyone who does not want them without
+   * taking the feature away from anyone who does.
+   */
+  showLife: boolean
   source: {
     kind: SourceKind
     deviceId: string
@@ -346,6 +355,7 @@ export const DEFAULT_CONFIG: Config = {
   panes: { wave: true, spectrum: true, spectrogram: true, vector: true },
   split: { ...DEFAULT_SPLIT },
   themeId: 'studio',
+  showLife: false,
   source: {
     kind: 'microphone',
     deviceId: '',
@@ -519,7 +529,13 @@ export function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return structuredClone(DEFAULT_CONFIG)
-    return merge(structuredClone(DEFAULT_CONFIG), JSON.parse(raw))
+    const stored = JSON.parse(raw) as Record<string, unknown>
+    const config = merge(structuredClone(DEFAULT_CONFIG), stored)
+    // A profile written before the tab could be hidden has no opinion about hiding it, and
+    // taking the default would leave anyone already running the organism with it still on screen
+    // and no way to reach its controls. Having it on counts as having asked for it.
+    if (!('showLife' in stored) && config.life.enabled) config.showLife = true
+    return config
   } catch {
     return structuredClone(DEFAULT_CONFIG)
   }
