@@ -16,7 +16,7 @@ import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
 import { PANE_SPECS, clampSplit, enabledCount, type Layout, type LayoutAxes, type Pane } from './layout.ts'
-import { fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
+import { dismissHints, fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
 import { MidiInput, ALL_INPUTS, signalLabel } from './midi.ts'
 import { MidiBindings, describeId } from './midi-bindings.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
@@ -217,6 +217,9 @@ export class Overlay {
 
     this.body = document.createElement('div')
     this.body.className = 'ws-body'
+    // A hint is positioned where its icon was when it opened. Scroll the panel and the icon
+    // moves out from under it, so the bubble goes rather than hanging over the wrong control.
+    this.body.addEventListener('scroll', () => dismissHints(), { passive: true })
 
     this.panel = document.createElement('section')
     this.panel.className = 'ws-panel'
@@ -493,6 +496,9 @@ export class Overlay {
   /** Rebuilds the active tab's controls. Called on tab change and on structural config change. */
   rebuild(): void {
     const scroll = this.body.scrollTop
+    // The bubble is anchored to an element that is about to be replaced, so it would be left
+    // pointing at nothing.
+    dismissHints()
     this.midi.reindex()
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
       this.syncChrome()

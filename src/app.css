@@ -462,17 +462,9 @@ body {
   margin-top: 2px;
 }
 
-.ws-field {
-  margin-bottom: 12px;
-}
-
 .ws-control {
   display: block;
   margin-bottom: 12px;
-}
-
-.ws-field .ws-control {
-  margin-bottom: 3px;
 }
 
 .ws-control-inline {
@@ -561,11 +553,72 @@ body {
   text-align: right;
 }
 
+/* Still the keyboard reference's detail text, which is a list and not a control. */
 .ws-hint {
   margin: 0;
   font-size: 10.5px;
   line-height: 1.45;
   color: var(--ws-faint);
+}
+
+.ws-help {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  margin-left: 5px;
+  padding: 0;
+  border: 1px solid var(--ws-line);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ws-faint);
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  opacity: 0.5;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.ws-control:hover .ws-help,
+.ws-help:hover,
+.ws-help:focus-visible {
+  opacity: 1;
+  color: var(--ws-text);
+  border-color: var(--ws-line-strong);
+}
+
+/*
+ * Fixed to the viewport, not to the panel. The panel scrolls its own body, so a bubble parented
+ * inside it would be clipped by that overflow — worst on the controls furthest down, which is
+ * where the longest explanations happen to live.
+ */
+.ws-tip {
+  position: fixed;
+  z-index: 60;
+  max-width: 320px;
+  padding: 9px 11px;
+  border: 1px solid var(--ws-line-strong);
+  border-radius: 7px;
+  background: var(--ws-panel-solid);
+  color: var(--ws-text);
+  font-size: 11px;
+  line-height: 1.5;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 45%);
+  pointer-events: none;
+  /*
+   * Shown and hidden outright, with no fade. A transition here would be the third time in this
+   * program that a transitioned property got stuck at its start value: the clock that advances
+   * them does not run while a tab is in the background, so the bubble would open invisible and
+   * stay that way until something else forced a repaint. A tooltip gains nothing from a fade
+   * that is worth that.
+   */
+  display: none;
+}
+
+.ws-tip-open {
+  display: block;
 }
 
 .ws-note {
@@ -1102,7 +1155,6 @@ body {
 
 /* Reachable by keyboard even while faint, and revealed when the row is under the pointer. */
 .ws-control:hover .ws-midi,
-.ws-field:hover .ws-midi,
 .ws-midi:hover,
 .ws-midi:focus-visible {
   opacity: 1;

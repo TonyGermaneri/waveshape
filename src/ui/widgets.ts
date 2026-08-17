@@ -161,11 +161,96 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node
 }
 
-function withHint(row: HTMLElement, hint?: string): HTMLElement {
-  if (!hint) return row
-  const wrap = el('div', 'ws-field')
-  wrap.append(row, el('p', 'ws-hint', hint))
-  return wrap
+// ---------------------------------------------------------------------------------------
+// Hints
+// ---------------------------------------------------------------------------------------
+//
+// Every control has an explanation, and printing them all cost more room than the controls did:
+// the Life tab ran to several screens of prose with sliders scattered through it. They live
+// behind a question mark now, one per control, and only the one being asked about is on screen.
+//
+// One bubble, shared, fixed to the viewport. The obvious implementation — a hidden paragraph
+// beside each control, revealed on hover — is clipped by the panel's own scroll container, so a
+// hint on a control near the bottom would be cut off exactly where it is longest. A single
+// element positioned against the icon's measured rectangle has no such edge, costs one node
+// instead of two hundred, and cannot drift out of sync with what is being hovered.
+
+let tipNode: HTMLElement | null = null
+let tipOwner: HTMLElement | null = null
+
+function tip(): HTMLElement {
+  if (tipNode) return tipNode
+  const node = el('div', 'ws-tip')
+  node.setAttribute('role', 'tooltip')
+  node.id = 'ws-tip'
+  document.body.append(node)
+  tipNode = node
+  return node
+}
+
+function hideTip(owner?: HTMLElement): void {
+  // Ignore a hide from something that is no longer the one showing: moving between two icons
+  // fires the new pointerenter before the old pointerleave, and honouring both would blank the
+  // bubble that had just been asked for.
+  if (owner && tipOwner !== owner) return
+  tipOwner = null
+  tipNode?.classList.remove('ws-tip-open')
+}
+
+function showTip(owner: HTMLElement, text: string): void {
+  const node = tip()
+  tipOwner = owner
+  node.textContent = text
+  node.classList.add('ws-tip-open')
+
+  // Measure after the text is in and the bubble is displayed, or the height is last time's.
+  const anchor = owner.getBoundingClientRect()
+  const box = node.getBoundingClientRect()
+  const margin = 8
+
+  // Left of the icon by preference: the panel is a column down the right-hand edge, so that is
+  // where the room is and the bubble never covers the control being explained. Below it when
+  // there is not enough — a narrow window, or the panel moved.
+  let left = anchor.left - box.width - margin
+  let top = anchor.top + anchor.height / 2 - box.height / 2
+  if (left < margin) {
+    left = Math.min(anchor.left, window.innerWidth - box.width - margin)
+    top = anchor.bottom + margin
+  }
+  node.style.left = `${Math.max(margin, left)}px`
+  node.style.top = `${Math.max(margin, Math.min(top, window.innerHeight - box.height - margin))}px`
+}
+
+/**
+ * The question mark. Hover or focus to read, tap to pin — a touch screen has no hover, and a
+ * hint you cannot reach on a phone is a hint that is not there.
+ */
+function hintButton(text: string): HTMLElement {
+  const button = el('button', 'ws-help', '?')
+  button.type = 'button'
+  button.tabIndex = 0
+  button.setAttribute('aria-label', 'Explain this control')
+  button.setAttribute('aria-describedby', 'ws-tip')
+  const open = () => showTip(button, text)
+  const close = () => hideTip(button)
+  button.addEventListener('pointerenter', open)
+  button.addEventListener('pointerleave', close)
+  button.addEventListener('focus', open)
+  button.addEventListener('blur', close)
+  button.addEventListener('click', (event) => {
+    event.preventDefault()
+    // These sit inside <label> elements, which forward a click to their own input — explaining
+    // a slider would otherwise move it.
+    event.stopPropagation()
+    if (tipOwner === button) close()
+    else open()
+  })
+  return button
+}
+
+/** Closes the bubble when the thing it was pointing at has moved out from under it. */
+export function dismissHints(): void {
+  hideTip()
 }
 
 /**
@@ -173,16 +258,18 @@ function withHint(row: HTMLElement, hint?: string): HTMLElement {
  * pre-formatted from the caller: `keymap` reads `fmt` from this module, so this module must not
  * read anything back out of `keymap`.
  */
-function labelWith(text: string, keys?: readonly string[]): HTMLElement {
+function labelWith(text: string, keys?: readonly string[], hint?: string): HTMLElement {
   const span = el('span', 'ws-label', text)
-  if (!keys?.length) return span
-  const caps = el('span', 'ws-label-keys')
-  for (const cap of keys) {
-    const kbd = el('kbd')
-    kbd.textContent = cap
-    caps.append(kbd)
+  if (keys?.length) {
+    const caps = el('span', 'ws-label-keys')
+    for (const cap of keys) {
+      const kbd = el('kbd')
+      kbd.textContent = cap
+      caps.append(kbd)
+    }
+    span.append(caps)
   }
-  span.append(caps)
+  if (hint) span.append(hintButton(hint))
   return span
 }
 
@@ -287,7 +374,7 @@ export function buildControl(
     }
     case 'select': {
       const row = el('label', 'ws-control')
-      row.append(headWith(labelWith(control.label, control.keys), bind))
+      row.append(headWith(labelWith(control.label, control.keys, control.hint), bind))
       const select = el('select', 'ws-select')
       for (const option of control.options) {
         const opt = el('option')
@@ -301,7 +388,7 @@ export function buildControl(
       })
       row.append(select)
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           select.value = control.get()
           select.disabled = control.disabled?.() ?? false
@@ -311,7 +398,7 @@ export function buildControl(
     }
     case 'slider': {
       const row = el('label', 'ws-control')
-      const labelEl = labelWith(control.label, control.keys)
+      const labelEl = labelWith(control.label, control.keys, control.hint)
       const valueEl = el('span', 'ws-value')
       const head = el('span', 'ws-control-head')
       head.append(labelEl, valueEl)
@@ -340,7 +427,7 @@ export function buildControl(
       row.append(head, input)
       const format = control.format ?? ((v: number) => String(Math.round(v * 1000) / 1000))
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           const v = control.get()
           input.value = log
@@ -360,10 +447,10 @@ export function buildControl(
         control.set(input.checked)
         onChange(true)
       })
-      row.append(input, labelWith(control.label, control.keys))
+      row.append(input, labelWith(control.label, control.keys, control.hint))
       if (bind) row.append(bind.element)
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           input.checked = control.get()
           input.disabled = control.disabled?.() ?? false
@@ -379,9 +466,9 @@ export function buildControl(
         control.set(input.value)
         onChange(false)
       })
-      row.append(input, el('span', 'ws-label', control.label))
+      row.append(input, labelWith(control.label, undefined, control.hint))
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           input.value = control.get()
         },
@@ -397,7 +484,7 @@ export function buildControl(
       })
       if (!bind) {
         return {
-          element: withHint(button, control.hint),
+          element: button,
           refresh: () => {
             button.disabled = control.disabled?.() ?? false
           },
@@ -406,7 +493,7 @@ export function buildControl(
       const pair = el('span', 'ws-control-inline')
       pair.append(button, bind.element)
       return {
-        element: withHint(pair, control.hint),
+        element: pair,
         refresh: () => {
           button.disabled = control.disabled?.() ?? false
           bind.refresh()
@@ -415,7 +502,7 @@ export function buildControl(
     }
     case 'text': {
       const row = el('label', 'ws-control')
-      row.append(el('span', 'ws-label', control.label))
+      row.append(labelWith(control.label, undefined, control.hint))
       const input = el('input', 'ws-input')
       input.type = 'text'
       if (control.placeholder) input.placeholder = control.placeholder
@@ -431,7 +518,7 @@ export function buildControl(
       })
       row.append(input)
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           // Never write over a field being typed into: the caret would jump to the end.
           if (document.activeElement !== input) input.value = control.get()
@@ -440,7 +527,7 @@ export function buildControl(
     }
     case 'textarea': {
       const row = el('label', 'ws-control')
-      row.append(el('span', 'ws-label', control.label))
+      row.append(labelWith(control.label, undefined, control.hint))
       const input = el('textarea', 'ws-input ws-textarea')
       input.rows = control.rows ?? 5
       input.spellcheck = false
@@ -451,7 +538,7 @@ export function buildControl(
       })
       row.append(input)
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           if (document.activeElement !== input) input.value = control.get()
         },
@@ -459,7 +546,7 @@ export function buildControl(
     }
     case 'swatches': {
       const wrap = el('div', 'ws-control')
-      wrap.append(el('span', 'ws-label', control.label))
+      wrap.append(labelWith(control.label, undefined, control.hint))
       const grid = el('div', 'ws-swatches')
       const buttons: { node: HTMLButtonElement; value: string }[] = []
       for (const option of control.options) {
@@ -489,7 +576,7 @@ export function buildControl(
       }
       wrap.append(grid)
       return {
-        element: withHint(wrap, control.hint),
+        element: wrap,
         refresh: () => {
           const current = control.get()
           for (const b of buttons) {
@@ -503,7 +590,7 @@ export function buildControl(
     case 'readout': {
       const row = el('div', 'ws-control ws-control-inline')
       const value = el('span', 'ws-value ws-value-wide')
-      row.append(el('span', 'ws-label', control.label))
+      row.append(labelWith(control.label, undefined, control.hint))
 
       let fill: HTMLElement | null = null
       if (control.meter) {
@@ -517,7 +604,7 @@ export function buildControl(
 
       const origin = control.origin ?? 0
       return {
-        element: withHint(row, control.hint),
+        element: row,
         refresh: () => {
           value.textContent = control.get()
           if (!fill || !control.meter) return
