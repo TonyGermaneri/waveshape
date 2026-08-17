@@ -22,6 +22,26 @@ import type { GpuInfo } from '../gpu/device.ts'
 import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
 import { PANE_SPECS, clampSplit, enabledCount, type Layout, type LayoutAxes, type Pane } from './layout.ts'
+import {
+  PANEL_MIN_HEIGHT,
+  PANEL_MIN_WIDTH,
+  clampDockSize,
+  clampFloat,
+  dockTarget,
+  edgesNear,
+  panelRect,
+  resizeDock,
+  resizeEdges,
+  resizeFloat,
+  stageInsets,
+  tornOff,
+  undockRect,
+  type PanelDock,
+  type Point,
+  type Rect,
+  type ResizeEdge,
+  type Size,
+} from './dock.ts'
 import { dismissHints, fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
 import { MidiInput, ALL_INPUTS, signalLabel } from './midi.ts'
 import { MidiBindings, describeId } from './midi-bindings.ts'
@@ -82,6 +102,46 @@ const GRAB_CORNER_SIZE = 88
  */
 const GRAB_CORNER_ZONE = GRAB_SIZE
 
+/** Thickness of a resize grab strip, and the size of a corner one, in CSS pixels. */
+const GRIP_THICKNESS = 10
+const GRIP_CORNER = 18
+
+/** The order ⇧H steps through, and the names the panel and the toast use for each. */
+const DOCK_ORDER: readonly PanelDock[] = ['right', 'bottom', 'left', 'top', 'float']
+const DOCK_LABELS: Record<PanelDock, string> = {
+  right: 'Docked right',
+  left: 'Docked left',
+  top: 'Docked top',
+  bottom: 'Docked bottom',
+  float: 'Floating',
+}
+
+/**
+ * One drag of the panel, whether it is being moved or resized.
+ *
+ * The rectangle and the pointer offset are taken once, at the start: a resize computed from the
+ * *current* rectangle each move compounds its own rounding, and a move computed from the current
+ * position drifts by whatever the last frame got wrong.
+ */
+interface PanelDrag {
+  /** `move`, or the edge being pulled. */
+  kind: 'move' | ResizeEdge
+  pointerId: number
+  start: Point
+  from: Rect
+  /** Where inside the panel the pointer took hold, so it stays there. */
+  offset: Point
+  /** The placement the drag began from. */
+  dock: PanelDock
+  /** Edges whose snap zone the pointer was already in — see `dockTarget`. */
+  muted: PanelDock[]
+  /** Whether a docked panel has been pulled off its edge yet. */
+  torn: boolean
+  /** Where it would land if it were dropped now. */
+  target: PanelDock
+  element: HTMLElement
+}
+
 const TABS = [
   'Source',
   'Analysis',
@@ -130,6 +190,12 @@ export class Overlay {
   private readonly root: HTMLElement
   private readonly deps: OverlayDeps
   private readonly panel: HTMLElement
+  private readonly frameLayer: HTMLElement
+  private readonly dockHint: HTMLElement
+  private readonly grips = new Map<ResizeEdge, HTMLElement>()
+  private drag: PanelDrag | null = null
+  /** Last geometry written, so a per-frame call can leave the DOM alone when nothing moved. */
+  private frameSignature = ''
   private readonly body: HTMLElement
   private readonly tabBar: HTMLElement
   private readonly readout: HTMLElement
@@ -275,6 +341,32 @@ export class Overlay {
     header.append(title, actions)
 
     this.panel.append(header, this.tabBar, this.body)
+    title.title = 'Drag to move the panel. Drop it against an edge to dock it there (⇧H).'
+
+    this.frameLayer = document.createElement('div')
+    this.frameLayer.className = 'ws-frame'
+    this.dockHint = document.createElement('div')
+    this.dockHint.className = 'ws-dock-hint'
+    this.frameLayer.append(this.dockHint)
+    for (const edge of resizeEdges('float')) {
+      const grip = document.createElement('div')
+      grip.className = 'ws-resize'
+      grip.dataset.edge = edge
+      grip.addEventListener('pointerdown', (event) => this.startDrag(event, edge, grip))
+      grip.addEventListener('pointermove', (event) => this.moveDrag(event))
+      grip.addEventListener('pointerup', (event) => this.endDrag(event))
+      grip.addEventListener('pointercancel', (event) => this.endDrag(event))
+      this.grips.set(edge, grip)
+      this.frameLayer.append(grip)
+    }
+
+    header.addEventListener('pointerdown', (event) => this.startDrag(event, 'move', header))
+    header.addEventListener('pointermove', (event) => this.moveDrag(event))
+    header.addEventListener('pointerup', (event) => this.endDrag(event))
+    header.addEventListener('pointercancel', (event) => this.endDrag(event))
+    // A window that changes shape can leave a placement out of range — a panel wider than the
+    // window it is in, or one docked to an edge that has moved under it.
+    window.addEventListener('resize', () => this.applyFrame())
 
     this.readout = document.createElement('div')
     this.readout.className = 'ws-readout'
@@ -282,8 +374,16 @@ export class Overlay {
     this.toast = document.createElement('div')
     this.toast.className = 'ws-toast'
 
-    this.root.append(this.labelLayer, this.splitLayer, this.panel, this.readout, this.toast)
+    this.root.append(
+      this.labelLayer,
+      this.splitLayer,
+      this.panel,
+      this.frameLayer,
+      this.readout,
+      this.toast,
+    )
 
+    this.applyFrame()
     this.syncChrome()
     onFullscreenChange(() => {
       this.syncFullscreenButton()
@@ -330,6 +430,9 @@ export class Overlay {
   setVisible(visible: boolean): void {
     this.visible = visible
     this.panel.classList.toggle('ws-hidden', !visible)
+    // Dismissing a docked panel hands its room back to the canvas — which is what makes docking
+    // safe to have on by default, since the whole viewport is always one keystroke away.
+    this.applyFrame()
     // Anything could have moved while the panel was away — a shortcut, a preset, a theme — so
     // it comes back showing the truth rather than whatever it was displaying when it left.
     if (visible) this.rebuild()
@@ -414,6 +517,265 @@ export class Overlay {
     this.syncChrome()
     this.deps.onChange()
     this.rebuild()
+  }
+
+  // -------------------------------------------------------------------------------------
+  // Panel placement
+  // -------------------------------------------------------------------------------------
+
+  private viewport(): Size {
+    return { width: window.innerWidth, height: window.innerHeight }
+  }
+
+  /**
+   * Puts the panel where the profile says it goes, and tells the canvas how much room it has
+   * left. Everything that can move the panel — a drag, the placement menu, a shortcut, a window
+   * resize, dismissing it — ends here, so there is one function that decides what the geometry
+   * actually is and no second path that could disagree with it.
+   *
+   * The canvas is not resized directly: four custom properties are, and the stylesheet insets
+   * the canvas, the label layer, the divider layer and the readout from them together. The
+   * renderer finds out the way it finds out about a window resize, through the observer already
+   * watching the canvas, which means docking costs the render path nothing at all.
+   */
+  private applyFrame(): void {
+    const placement = this.deps.config.panel
+    const view = this.viewport()
+    const rect = panelRect(placement, view)
+    const insets = stageInsets(placement, view, this.visible)
+    const signature = `${JSON.stringify(rect)}|${JSON.stringify(insets)}|${placement.dock}|${placement.push}|${this.visible}`
+    if (signature === this.frameSignature) return
+    this.frameSignature = signature
+
+    const root = document.documentElement.style
+    root.setProperty('--ws-stage-t', `${insets.top}px`)
+    root.setProperty('--ws-stage-r', `${insets.right}px`)
+    root.setProperty('--ws-stage-b', `${insets.bottom}px`)
+    root.setProperty('--ws-stage-l', `${insets.left}px`)
+
+    const style = this.panel.style
+    style.left = `${rect.x}px`
+    style.top = `${rect.y}px`
+    style.width = `${rect.width}px`
+    style.height = `${rect.height}px`
+
+    const docked = placement.dock !== 'float'
+    this.panel.classList.toggle('ws-docked', docked)
+    for (const edge of DOCK_ORDER) {
+      if (edge !== 'float') this.panel.classList.toggle(`ws-dock-${edge}`, placement.dock === edge)
+    }
+    // Docked over the canvas rather than displacing it: it needs a shadow to read as being above.
+    this.panel.classList.toggle('ws-over', docked && !placement.push)
+
+    // Dismissed toward the edge it belongs to, so it leaves the way you would push it.
+    const shift: Record<PanelDock, [number, number]> = {
+      right: [16, 0],
+      left: [-16, 0],
+      top: [0, -16],
+      bottom: [0, 16],
+      float: [0, 10],
+    }
+    const [hideX, hideY] = shift[placement.dock]
+    style.setProperty('--ws-hide-x', `${hideX}px`)
+    style.setProperty('--ws-hide-y', `${hideY}px`)
+
+    this.syncGrips(rect, placement.dock)
+  }
+
+  /**
+   * Places the grab strips astride the panel's edges. A floating panel offers all eight, with
+   * the corners taking their ends so that a corner drag is unambiguous; a docked one offers only
+   * the edge with canvas on the other side of it, running its full length — the other three are
+   * against the side of the window and there is nothing there to drag them into.
+   */
+  private syncGrips(rect: Rect, dock: PanelDock): void {
+    const wanted = new Set(resizeEdges(dock))
+    const inset = dock === 'float' ? GRIP_CORNER : 0
+    const half = GRIP_THICKNESS / 2
+    const boxes: Record<ResizeEdge, Rect> = {
+      n: { x: rect.x + inset, y: rect.y - half, width: rect.width - inset * 2, height: GRIP_THICKNESS },
+      s: {
+        x: rect.x + inset,
+        y: rect.y + rect.height - half,
+        width: rect.width - inset * 2,
+        height: GRIP_THICKNESS,
+      },
+      w: { x: rect.x - half, y: rect.y + inset, width: GRIP_THICKNESS, height: rect.height - inset * 2 },
+      e: {
+        x: rect.x + rect.width - half,
+        y: rect.y + inset,
+        width: GRIP_THICKNESS,
+        height: rect.height - inset * 2,
+      },
+      nw: { x: rect.x - half, y: rect.y - half, width: GRIP_CORNER, height: GRIP_CORNER },
+      ne: {
+        x: rect.x + rect.width - GRIP_CORNER + half,
+        y: rect.y - half,
+        width: GRIP_CORNER,
+        height: GRIP_CORNER,
+      },
+      sw: {
+        x: rect.x - half,
+        y: rect.y + rect.height - GRIP_CORNER + half,
+        width: GRIP_CORNER,
+        height: GRIP_CORNER,
+      },
+      se: {
+        x: rect.x + rect.width - GRIP_CORNER + half,
+        y: rect.y + rect.height - GRIP_CORNER + half,
+        width: GRIP_CORNER,
+        height: GRIP_CORNER,
+      },
+    }
+    for (const [edge, node] of this.grips) {
+      // A hidden panel has no edges to grab, and a grip left behind would be an invisible strip
+      // of dead canvas.
+      if (!wanted.has(edge) || !this.visible) {
+        node.style.display = 'none'
+        continue
+      }
+      const box = boxes[edge]
+      node.style.display = ''
+      node.style.left = `${box.x}px`
+      node.style.top = `${box.y}px`
+      node.style.width = `${Math.max(0, box.width)}px`
+      node.style.height = `${Math.max(0, box.height)}px`
+    }
+  }
+
+  private startDrag(event: PointerEvent, kind: 'move' | ResizeEdge, element: HTMLElement): void {
+    if (event.button !== 0) return
+    // The header is a title bar and a row of buttons at once, and the buttons come first.
+    if (kind === 'move' && (event.target as HTMLElement | null)?.closest('button, input, select, a')) {
+      return
+    }
+    const placement = this.deps.config.panel
+    const view = this.viewport()
+    const from = panelRect(placement, view)
+    const point = { x: event.clientX, y: event.clientY }
+    this.drag = {
+      kind,
+      pointerId: event.pointerId,
+      start: point,
+      from,
+      offset: { x: point.x - from.x, y: point.y - from.y },
+      dock: placement.dock,
+      muted: edgesNear(point, view),
+      torn: placement.dock === 'float',
+      target: placement.dock,
+      element,
+    }
+    element.setPointerCapture(event.pointerId)
+    if (kind === 'move') this.panel.classList.add('ws-moving')
+    else element.classList.add('ws-resizing')
+    // A hint bubble anchored to a control in a panel that is about to move would be left behind.
+    dismissHints()
+    event.preventDefault()
+  }
+
+  private moveDrag(event: PointerEvent): void {
+    const drag = this.drag
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const placement = this.deps.config.panel
+    const view = this.viewport()
+    const point = { x: event.clientX, y: event.clientY }
+
+    if (drag.kind === 'move') {
+      // An edge the pointer began inside stops being ignored the moment it leaves.
+      const near = edgesNear(point, view)
+      drag.muted = drag.muted.filter((edge) => near.includes(edge))
+
+      if (!drag.torn && tornOff(drag.dock, drag.start, point)) {
+        drag.torn = true
+        const rect = undockRect(placement, drag.from, point, view)
+        placement.dock = 'float'
+        placement.float = rect
+        // The panel is a different size now, so where the pointer sits inside it has changed.
+        drag.offset = { x: point.x - rect.x, y: point.y - rect.y }
+      }
+      if (drag.torn) {
+        placement.float = clampFloat(
+          {
+            x: point.x - drag.offset.x,
+            y: point.y - drag.offset.y,
+            width: placement.float.width,
+            height: placement.float.height,
+          },
+          view,
+        )
+        drag.target = dockTarget(point, view, drag.muted)
+      }
+      this.showDockHint(drag.torn ? drag.target : 'float', view)
+    } else if (placement.dock === 'float') {
+      placement.float = resizeFloat(drag.from, drag.kind, point, view)
+    } else {
+      placement.size = resizeDock(placement.dock, point, view)
+    }
+    this.applyFrame()
+  }
+
+  private endDrag(event: PointerEvent): void {
+    const drag = this.drag
+    if (!drag || drag.pointerId !== event.pointerId) return
+    this.drag = null
+    if (drag.element.hasPointerCapture(event.pointerId)) {
+      drag.element.releasePointerCapture(event.pointerId)
+    }
+    this.panel.classList.remove('ws-moving')
+    drag.element.classList.remove('ws-resizing')
+    this.showDockHint('float', this.viewport())
+
+    const placement = this.deps.config.panel
+    if (drag.kind === 'move' && drag.torn && drag.target !== 'float') placement.dock = drag.target
+    this.applyFrame()
+    this.deps.onChange()
+    // The placement menu and the size slider are showing values the drag has just changed.
+    if (this.visible) this.refreshControls()
+  }
+
+  /** Shows where a dropped panel would land, or hides the hint when it would stay where it is. */
+  private showDockHint(target: PanelDock, view: Size): void {
+    if (target === 'float') {
+      this.dockHint.classList.remove('ws-dock-hint-show')
+      return
+    }
+    const rect = panelRect({ ...this.deps.config.panel, dock: target }, view)
+    this.dockHint.style.left = `${rect.x}px`
+    this.dockHint.style.top = `${rect.y}px`
+    this.dockHint.style.width = `${rect.width}px`
+    this.dockHint.style.height = `${rect.height}px`
+    this.dockHint.classList.add('ws-dock-hint-show')
+  }
+
+  /** Moves the panel to a placement by name. Returns what to say about it. */
+  setDock(dock: PanelDock): string {
+    const placement = this.deps.config.panel
+    if (placement.dock !== dock) {
+      placement.dock = dock
+      this.applyFrame()
+      this.deps.onChange()
+      // Docking and floating disable different controls, so the panel is rebuilt rather than
+      // refreshed.
+      if (this.visible) this.rebuild()
+    }
+    return DOCK_LABELS[dock]
+  }
+
+  /** Steps through the placements; returns the label of the one landed on. */
+  cycleDock(dir: number): string {
+    const index = DOCK_ORDER.indexOf(this.deps.config.panel.dock)
+    const from = index < 0 ? 0 : index
+    return this.setDock(DOCK_ORDER[(from + dir + DOCK_ORDER.length) % DOCK_ORDER.length])
+  }
+
+  /** Puts the panel back where it starts, at its default thickness. */
+  resetPanel(): void {
+    const placement = this.deps.config.panel
+    Object.assign(placement, structuredClone(DEFAULT_CONFIG.panel))
+    this.applyFrame()
+    this.deps.onChange()
+    if (this.visible) this.rebuild()
+    this.notify(`Panel reset  ·  ${DOCK_LABELS[placement.dock].toLowerCase()}`)
   }
 
   /**
@@ -535,6 +897,9 @@ export class Overlay {
     this.midi.reindex()
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
       this.syncChrome()
+      // Any control may have been one that moves or resizes the panel. Cheap when it was not:
+      // the geometry is compared before a single style property is written.
+      this.applyFrame()
       this.deps.onChange()
       if (structural) {
         // A discrete choice can change which controls exist — switching the source from a
@@ -570,6 +935,19 @@ export class Overlay {
     if (this.visible) this.refreshControls()
   }
 
+  /**
+   * The readout bar.
+   *
+   * Every field carries the width of the widest reading it can produce, in characters, and holds
+   * that width whatever it is currently showing. A row of numbers that resizes itself is a row
+   * that slides sideways under the eye every time one of them gains a digit — and the readings
+   * that move most are exactly the ones being watched. The face is monospaced, so a character is
+   * a fixed width and `ch` is an exact measure of how many can fit.
+   *
+   * Slots are kept rather than removed for the same reason: the pitch and clarity of a silent
+   * signal read as a dash, because dropping the pair would shunt half the bar to the left every
+   * time the room went quiet.
+   */
   private readoutItems(s: OverlayStatus): HTMLElement[] {
     const items: [string, string][] = []
     const e = s.engine
@@ -581,7 +959,7 @@ export class Overlay {
     items.push(['src', source])
     items.push(['rate', e.sampleRate ? `${(e.sampleRate / 1000).toFixed(1)} kHz` : '—'])
     items.push(['fft', `${this.deps.config.analysis.fftSize}`])
-    items.push(['Δf', `${s.binHz.toFixed(2)} Hz`])
+    items.push(['\u0394f', `${s.binHz.toFixed(2)} Hz`])
     items.push(['enbw', `${s.enbwHz.toFixed(2)} Hz`])
     items.push(['rate/s', `${s.analysisFps.toFixed(0)}`])
     // The pitch estimate only drives the oscilloscope's trigger, so it is only worth the space
@@ -592,7 +970,7 @@ export class Overlay {
     }
     const l = s.loudness
     if (l) {
-      const num = (v: number) => (Number.isFinite(v) ? v.toFixed(1) : '−∞')
+      const num = (v: number) => (Number.isFinite(v) ? v.toFixed(1) : '\u2212\u221e')
       items.push(['M', num(l.momentary)])
       items.push(['S', num(l.shortTerm)])
       items.push(['I', num(l.integrated)])
@@ -2643,7 +3021,49 @@ export class Overlay {
     // Read live, for the same reason as the meters: these are the numbers you watch while
     // changing something else, and a frozen frame rate is worse than none.
     const engine = () => this.live.engine
+    const p = c.panel
+    const floating = () => p.dock === 'float'
     return [
+      { kind: 'heading', text: 'Panel' },
+      {
+        kind: 'select',
+        label: 'Placement',
+        keys: this.keysFor('Panel placement'),
+        options: DOCK_ORDER.map((dock) => ({ value: dock, label: DOCK_LABELS[dock] })),
+        get: () => p.dock,
+        set: (v) => void this.setDock(v as PanelDock),
+        hint: 'The panel is also a window: drag it by its title bar to move it, drop it against an edge to dock it there, and pull any edge or corner to resize it. A docked panel takes its room out of the canvas rather than covering it — and hiding the panel gives that room straight back, so the whole viewport is always one keystroke away.',
+      },
+      {
+        kind: 'slider',
+        label: 'Thickness',
+        min: Math.min(PANEL_MIN_WIDTH, PANEL_MIN_HEIGHT),
+        max: 900,
+        step: 1,
+        get: () => p.size,
+        set: (v) => {
+          p.size = clampDockSize(v, p.dock, this.viewport())
+        },
+        format: (v) => `${Math.round(v)} px`,
+        disabled: floating,
+        hint: 'How far the panel reaches in from its edge — its width docked to a side, its height docked above or below. One measurement for all four, because it is a property of the panel rather than of the edge it happens to be on.',
+      },
+      {
+        kind: 'toggle',
+        label: 'Take room from the canvas',
+        get: () => p.push,
+        set: (v) => {
+          p.push = v
+        },
+        disabled: floating,
+        hint: 'On, the instrument is inset to clear the panel and every pane is redrawn to fit the room that is left. Off, the panel lies over the trace as a floating one does — the analyser keeps the whole viewport and the panel keeps whatever the theme gives it for translucency.',
+      },
+      {
+        kind: 'button',
+        label: 'Reset the panel',
+        action: 'reset-panel',
+        onClick: () => this.resetPanel(),
+      },
       { kind: 'heading', text: 'Panes' },
       ...PANE_SPECS.map((spec, index) => ({
         kind: 'toggle' as const,

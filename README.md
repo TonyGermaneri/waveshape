@@ -53,6 +53,15 @@ Capture starts on its own — there is no button to find before the first trace 
 `space`, `esc` or `h` to toggle the overlay, `f` for full screen, `?` for the keyboard
 reference. Transport (▶ / ❚❚ / ↺) sits at the top of the panel, on `r` and `shift R`.
 
+**The panel is a window as well as a panel.** Drag it by its title bar to move it, drop it
+against any edge to dock it there, and pull any edge or corner to resize it — `⇧H` steps through
+the same five placements without the mouse. Docked, it takes its room out of the canvas rather
+than covering it, and every pane is re-laid-out into what is left; the analyser finds out through
+the same resize observer that already watches for the window changing shape, so a dock costs the
+render path nothing. Dismissing the panel gives that room straight back, which is what makes it
+safe to have a dock on by default: the whole viewport is always one keystroke away. Floating, it
+takes nothing and behaves as it always did. Both are remembered with the rest of the profile.
+
 ---
 
 ## Controls
@@ -69,6 +78,7 @@ related quantity — `o` `p` is the oscilloscope's span, `⇧O` `⇧P` the spect
 | | |
 | --- | --- |
 | `space` `esc` `h` | Show or hide the control panel |
+| `⇧H` | Panel placement — right, bottom, left, top, floating |
 | `f` · `?` `F1` · `` ` `` `~` | Full screen · keyboard reference · next / previous tab |
 | `1` `2` `3` `4` · `\` | Switch a visualisation on or off · reset the layout |
 | `-` `=` · `[` `]` · `q` `w` · `a` `s` | FFT size · hop · window · averaging |
@@ -318,6 +328,17 @@ straight lines between samples show a shape the signal never had — so the trac
 Whittaker-Shannon interpolant, which is why a square wave correctly shows Gibbs overshoot
 instead of perfect corners.
 
+**The canvas is inset by one number, and only when something is holding it.** A docked panel
+takes its room through four custom properties on the root, and the stylesheet insets the canvas,
+the axis labels, the divider layer and the readout from the same four — so the instrument moves
+out of the way as one thing, or not at all. Nothing in the render path knows that docking exists:
+the canvas box changes, the observer already watching it fires, and the next frame is drawn at
+the new size, exactly as it would be for a window resize. One trap in doing it that way is worth
+naming, because it does not look like a CSS problem: a canvas is a *replaced* element, so with
+`width: auto` it takes its intrinsic size — the bitmap's — and the `right` inset is dropped as
+over-constrained. The box then sets the framebuffer, the framebuffer sets the box, and the two
+grow into each other until they hit the device's maximum texture size. It is sized, not inset.
+
 **The vectorscope's divisions are amplitudes, not fractions of the pane.** A goniometer figure
 is scaled by the *shorter* side of its pane, because anything else turns a circle into an
 ellipse — so on a pane that is not square the ±1 division is not at the pane's edge, and drawing
@@ -433,7 +454,7 @@ src/
   dsp/      windows, reference FFT, biquads, BS.1770-4 loudness, tests
   gpu/      device init, compute orchestration, render passes
     shaders/  WGSL: prepare, fft, unpack, analyze, envelope, nsdf, speccols, draw_*, post
-  ui/       tabbed overlay, quad layout, controls, keyboard map and reference, themes, graticule
+  ui/       tabbed overlay, quad layout, panel placement, controls, keyboard map, themes, graticule
   workers/  loudness metering
 ```
 

@@ -6,6 +6,7 @@
 
 import type { GeneratorKind, SourceKind } from './audio/engine.ts'
 import type { WindowId } from './dsp/windows.ts'
+import type { PanelPlacement } from './ui/dock.ts'
 
 export type Mode = 'wave' | 'spectrum' | 'spectrogram' | 'vector'
 
@@ -56,6 +57,12 @@ export type PaneToggles = Record<Mode, boolean>
 export interface Config {
   panes: PaneToggles
   split: LayoutSplit
+  /**
+   * Where the control panel sits and how big it is. Placement is not a theme property — a theme
+   * is a look, and where you keep your tools is a habit — so it lives here rather than in `ui`,
+   * and a theme change never moves the panel. See `ui/dock.ts` for what the fields mean.
+   */
+  panel: PanelPlacement
   /** Id of the theme last applied. Only used to show which entry is current. */
   themeId: string
   /**
@@ -391,6 +398,13 @@ export const DEFAULT_SPLIT: LayoutSplit = { x: 0.5, y: 0.5 }
 export const DEFAULT_CONFIG: Config = {
   panes: { wave: true, spectrum: true, spectrogram: true, vector: true },
   split: { ...DEFAULT_SPLIT },
+  panel: {
+    dock: 'right',
+    size: 420,
+    // Where it lands the first time it is pulled off an edge, before it has been put anywhere.
+    float: { x: 64, y: 64, width: 420, height: 640 },
+    push: true,
+  },
   themeId: 'studio',
   showLife: false,
   source: {
@@ -571,10 +585,27 @@ function merge<T>(base: T, patch: unknown): T {
   return out as T
 }
 
+/**
+ * The one thing the defaults cannot know: the shape of the screen they are about to appear on.
+ *
+ * A column down the right-hand side is the right place for the controls on anything with room
+ * for a column, and the wrong place on a phone, where it would leave the instrument a strip too
+ * narrow to read. Applied only when there is no stored profile, so it is a first impression
+ * rather than a rule — moving the panel afterwards is remembered like any other choice.
+ */
+function firstRun(config: Config): Config {
+  const width = typeof window === 'undefined' ? 0 : window.innerWidth
+  if (width > 0 && width < 640) {
+    config.panel.dock = 'bottom'
+    config.panel.size = 340
+  }
+  return config
+}
+
 export function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return structuredClone(DEFAULT_CONFIG)
+    if (!raw) return firstRun(structuredClone(DEFAULT_CONFIG))
     const stored = JSON.parse(raw) as Record<string, unknown>
     const config = merge(structuredClone(DEFAULT_CONFIG), stored)
     // A profile written before the tab could be hidden has no opinion about hiding it, and

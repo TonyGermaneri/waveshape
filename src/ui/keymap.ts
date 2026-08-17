@@ -40,6 +40,8 @@ export interface KeyActions {
   toggleFullscreen(): void
   toggleHelp(): void
   cycleTab(dir: number): string
+  /** Moves the panel to the next placement — the four edges, then floating. */
+  cycleDock(dir: number): string
   cycleTheme(dir: number): string
   restartSource(): void
   stopSource(): void
@@ -293,6 +295,16 @@ export const BINDINGS: readonly Binding[] = [
     label: 'Next / previous panel tab',
     group: 'Panel',
     run: (ctx, arg) => `Tab  ${ctx.actions.cycleTab(arg)}`,
+  },
+  {
+    // Forward only: `h` already hides the panel, and its shifted twin cannot itself be shifted.
+    keys: one('shift+h'),
+    label: 'Panel placement',
+    group: 'Panel',
+    detail:
+      'Right, bottom, left, top, then floating. A docked panel takes its room out of the canvas; dragging the title bar does the same thing by hand.',
+    structural: true,
+    run: (ctx, arg) => `Panel  ${ctx.actions.cycleDock(arg)}`,
   },
 
   // ------------------------------------------------------------------------------ panes

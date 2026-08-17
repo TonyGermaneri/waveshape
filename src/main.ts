@@ -382,6 +382,7 @@ async function main(): Promise<void> {
     toggleFullscreen: () => void overlay.toggleFullscreen(),
     toggleHelp: () => overlay.toggleHelp(),
     cycleTab: (dir) => overlay.cycleTab(dir),
+    cycleDock: (dir) => overlay.cycleDock(dir),
     cycleTheme: (dir) => overlay.cycleTheme(dir),
     restartSource: () => void startSource(),
     stopSource: () => void stopSource(),
@@ -410,7 +411,7 @@ async function main(): Promise<void> {
     overlay.noteTouchInput()
     // A tap that lands on a control belongs to that control, not to the canvas behind it.
     const target = event.target as Element | null
-    if (target?.closest?.('.ws-panel, .ws-grab, .ws-dialog, .ws-toast')) return
+    if (target?.closest?.('.ws-panel, .ws-grab, .ws-resize, .ws-dialog, .ws-toast')) return
 
     const near = Math.hypot(event.clientX - lastTapX, event.clientY - lastTapY) < 44
     if (event.timeStamp - lastTapAt < 320 && near) {

@@ -1,6 +1,10 @@
 /*
- * The canvas owns the viewport. Everything else floats above it and is dismissable, so the
- * waveform is never cropped to make room for chrome.
+ * The canvas owns the viewport, less whatever a docked panel is holding. That one exception is
+ * the `--ws-stage-*` insets below: everything that belongs to the canvas — the trace itself, the
+ * axis labels, the divider cross, the readout — is positioned inside them, so the whole
+ * instrument moves out of the panel's way together or not at all. A floating panel takes
+ * nothing, and neither does a hidden one, which is what keeps a keystroke away from the full
+ * viewport at all times.
  *
  * Every colour here is a custom property written by `ui/theme.ts`. The values below are the
  * defaults the page paints with before the first frame, and the fallback if a theme omits one —
@@ -8,6 +12,10 @@
  */
 
 :root {
+  --ws-stage-t: 0px;
+  --ws-stage-r: 0px;
+  --ws-stage-b: 0px;
+  --ws-stage-l: 0px;
   --ws-panel: rgba(14, 15, 18, 0.82);
   --ws-panel-solid: #0e0f12;
   --ws-line: rgba(255, 255, 255, 0.11);
@@ -51,11 +59,19 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/*
+ * Sized rather than inset, unlike the layers over it. A canvas is a replaced element: with
+ * `width: auto` it takes its *intrinsic* size — the bitmap's — and `right` is quietly dropped as
+ * over-constrained, which here means the framebuffer sets the box, the box sets the framebuffer
+ * through the resize observer, and the two grow into each other until they hit the device's
+ * maximum texture size.
+ */
 #stage {
   position: fixed;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  top: var(--ws-stage-t);
+  left: var(--ws-stage-l);
+  width: calc(100% - var(--ws-stage-l) - var(--ws-stage-r));
+  height: calc(100% - var(--ws-stage-t) - var(--ws-stage-b));
   display: block;
   touch-action: none;
 }
@@ -74,7 +90,10 @@ body {
 
 .ws-labels {
   position: absolute;
-  inset: 0;
+  top: var(--ws-stage-t);
+  right: var(--ws-stage-r);
+  bottom: var(--ws-stage-b);
+  left: var(--ws-stage-l);
   pointer-events: none;
   font-family: var(--ws-mono);
   font-size: 10px;
@@ -118,7 +137,10 @@ body {
  */
 .ws-split {
   position: absolute;
-  inset: 0;
+  top: var(--ws-stage-t);
+  right: var(--ws-stage-r);
+  bottom: var(--ws-stage-b);
+  left: var(--ws-stage-l);
   pointer-events: none;
 }
 
@@ -214,9 +236,9 @@ body {
 
 .ws-readout {
   position: absolute;
-  left: 12px;
-  bottom: 12px;
-  right: 12px;
+  left: calc(var(--ws-stage-l) + 12px);
+  bottom: calc(var(--ws-stage-b) + 12px);
+  right: calc(var(--ws-stage-r) + 12px);
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
@@ -237,12 +259,125 @@ body {
   margin-right: 5px;
 }
 
+/* ---------------------------------------------------------------- panel frame */
+
+/*
+ * The panel's edges, as things to take hold of.
+ *
+ * They are a layer of their own rather than children of the panel, for two reasons. The panel
+ * clips its own overflow, so a handle inside it could not straddle the boundary it is there to
+ * move — and the one edge a right-docked panel would want to grab is exactly where the body's
+ * scrollbar lives, which no amount of z-index makes shareable. Out here each handle sits astride
+ * the edge, half over the panel and half over the canvas, and is nobody's child.
+ *
+ * Like the divider cross, they are invisible until the pointer finds them: a permanent outline
+ * around the panel would be chrome drawn to advertise chrome.
+ */
+/*
+ * Written as a child selector so it outranks `#ui > *`, which is an id and would otherwise hand
+ * this layer the pointer for the whole viewport — and with it every event meant for the divider
+ * cross underneath.
+ */
+#ui > .ws-frame {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ws-resize {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.ws-resize::after {
+  content: '';
+  position: absolute;
+  background: var(--ws-accent);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.ws-resize:hover::after,
+.ws-resize.ws-resizing::after {
+  opacity: 0.55;
+}
+
+.ws-resize[data-edge='n'],
+.ws-resize[data-edge='s'] {
+  cursor: ns-resize;
+}
+
+.ws-resize[data-edge='e'],
+.ws-resize[data-edge='w'] {
+  cursor: ew-resize;
+}
+
+.ws-resize[data-edge='ne'],
+.ws-resize[data-edge='sw'] {
+  cursor: nesw-resize;
+}
+
+.ws-resize[data-edge='nw'],
+.ws-resize[data-edge='se'] {
+  cursor: nwse-resize;
+}
+
+/* The ink is a hairline down the middle of the grab area, not the whole of it. */
+.ws-resize[data-edge='n']::after,
+.ws-resize[data-edge='s']::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-1px);
+}
+
+.ws-resize[data-edge='e']::after,
+.ws-resize[data-edge='w']::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-1px);
+}
+
+/* Corners are cursor and hit area only: two hairlines meeting at a right angle is a box. */
+.ws-resize[data-edge='ne']::after,
+.ws-resize[data-edge='nw']::after,
+.ws-resize[data-edge='se']::after,
+.ws-resize[data-edge='sw']::after {
+  display: none;
+}
+
+/* Where a dropped panel would land. Shown only while a drag is over an edge. */
+.ws-dock-hint {
+  position: absolute;
+  border: 1px solid var(--ws-accent-line);
+  background: var(--ws-accent-soft);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.ws-dock-hint.ws-dock-hint-show {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-resize::after,
+  .ws-dock-hint {
+    transition: none;
+  }
+}
+
 /* ---------------------------------------------------------------- toast */
 
 .ws-toast {
   position: absolute;
-  left: 50%;
-  bottom: 44px;
+  /* Centred on the canvas rather than the window, so a docked panel does not sit on top of it. */
+  left: calc(var(--ws-stage-l) + (100% - var(--ws-stage-l) - var(--ws-stage-r)) / 2);
+  bottom: calc(var(--ws-stage-b) + 44px);
   transform: translate(-50%, 8px);
   max-width: min(80vw, 620px);
   padding: 7px 14px;
@@ -269,12 +404,16 @@ body {
 
 /* ---------------------------------------------------------------- panel */
 
+/*
+ * Geometry is written by `ui/overlay.ts` as inline `left/top/width/height`, because it is state
+ * the user sets by hand and the profile remembers — CSS can express a default but not a
+ * rectangle someone dragged. What stays here is everything that follows from *which* placement
+ * is in force: a floating panel is a window, with corners, a border all round and a shadow under
+ * it; a docked one is part of the frame of the application and has none of those on the sides it
+ * is flush against.
+ */
 .ws-panel {
   position: absolute;
-  top: 12px;
-  right: 12px;
-  bottom: 12px;
-  width: min(420px, calc(100vw - 24px));
   display: flex;
   flex-direction: column;
   background: var(--ws-panel);
@@ -287,9 +426,46 @@ body {
   transition: opacity 0.16s ease, transform 0.16s ease;
 }
 
+.ws-panel.ws-docked {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* The inner edge is the only one with a canvas on the other side of it. */
+.ws-panel.ws-dock-right {
+  border-left: 1px solid var(--ws-line);
+}
+
+.ws-panel.ws-dock-left {
+  border-right: 1px solid var(--ws-line);
+}
+
+.ws-panel.ws-dock-top {
+  border-bottom: 1px solid var(--ws-line);
+}
+
+.ws-panel.ws-dock-bottom {
+  border-top: 1px solid var(--ws-line);
+}
+
+/* Docked but lying over the trace rather than displacing it: it needs to read as being above. */
+.ws-panel.ws-docked.ws-over {
+  box-shadow: 0 0 46px var(--ws-shadow);
+}
+
+/* Nothing eases while it is being dragged — a transition on position is a panel that lags. */
+.ws-panel.ws-moving {
+  transition: none;
+}
+
+/*
+ * Dismissed toward whichever edge it lives on, so the panel goes the way it would if you pushed
+ * it. The shift is written per placement by the overlay.
+ */
 .ws-panel.ws-hidden {
   opacity: 0;
-  transform: translateX(12px);
+  transform: translate(var(--ws-hide-x, 12px), var(--ws-hide-y, 0px));
   pointer-events: none;
 }
 
@@ -297,6 +473,11 @@ body {
   display: none;
 }
 
+/*
+ * The header is the panel's handle as well as its title bar: dragging it moves the panel, and
+ * dropping it against an edge docks it there. The buttons keep their own cursor, and the text
+ * does not select, since a drag across a title that selects it looks like a bug.
+ */
 .ws-header {
   display: flex;
   align-items: center;
@@ -304,6 +485,14 @@ body {
   gap: 10px;
   padding: 12px 14px 10px;
   border-bottom: 1px solid var(--ws-line);
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.ws-panel.ws-moving .ws-header {
+  cursor: grabbing;
 }
 
 .ws-header-actions {
@@ -311,6 +500,7 @@ body {
   align-items: center;
   gap: 5px;
   flex: none;
+  cursor: default;
 }
 
 .ws-title strong {
@@ -1091,14 +1281,11 @@ body {
 }
 
 @media (max-width: 640px) {
-  .ws-panel {
-    top: auto;
-    height: 62vh;
-    width: calc(100vw - 16px);
-    right: 8px;
-    bottom: 8px;
-  }
-
+  /*
+   * The panel's own geometry is not overridden here any more: it is inline style now, which a
+   * stylesheet cannot reach, and the clamping in `ui/dock.ts` already keeps a placement usable
+   * at any size. A first run on a narrow screen picks the bottom edge instead — see `loadConfig`.
+   */
   .ws-readout {
     display: none;
   }
@@ -1114,6 +1301,10 @@ body {
   .ws-check,
   .ws-check::after {
     transition: none;
+  }
+
+  .ws-panel.ws-hidden {
+    transform: none;
   }
 
   .ws-icon.ws-pending {
