@@ -8,6 +8,8 @@
  */
 
 import type { Config, Mode } from '../config.ts'
+import { degreeOf, isTwelveTone, noteHz, noteName } from '../dsp/tuning.ts'
+import { findTuning } from '../dsp/tunings.ts'
 
 export interface GridLine {
   /** Position along its axis, 0..1. */
@@ -70,6 +72,74 @@ function decadeFrequencies(min: number, max: number): { f: number; major: boolea
   return out
 }
 
+/**
+ * The notes of the tuning that fall inside a frequency range, with the ones worth naming marked.
+ *
+ * Two densities, one rule each. A line is dropped when it would land within `MIN_LINE` of the
+ * previous one, because past that the graticule stops being a scale and becomes a wash — and at
+ * the bottom of a log axis, where a semitone is a few hundredths of a pixel, it would be a very
+ * expensive wash. A label is placed on the roots of the scale, which on a keyboard means every C,
+ * unless the range is narrow enough to hold no roots at all — a spectrum zoomed into a hundred
+ * hertz is not improved by being the only axis on screen with nothing written on it, so there
+ * the notes themselves are named.
+ */
+function noteLines(
+  config: Config,
+  min: number,
+  max: number,
+  log: boolean,
+): { pos: number; root: boolean; label?: string }[] {
+  /** Nearest two lines, as a fraction of the axis. */
+  const MIN_LINE = 0.006
+  /** And of two labels, which need room for the text between them. */
+  const MIN_LABEL = 0.045
+
+  const settings = config.tuning
+  const tuning = findTuning(settings.imported, settings.id)
+  const twelve = isTwelveTone(tuning)
+  const count = tuning.kind === 'scale' ? tuning.degrees.length : 12
+  const octaves = tuning.kind === 'map' || Math.abs(tuning.period - 1200) < 1e-6
+
+  const found: { pos: number; root: boolean; hz: number; midi: number }[] = []
+  let previous = -Infinity
+  // Low enough to be under any hearing and high enough to be over it: a keyboard is 128 keys, a
+  // spectrum axis runs to the Nyquist frequency, and the scale carries on past both of them.
+  for (let midi = -24; midi <= 200; midi++) {
+    const hz = noteHz(tuning, midi, settings)
+    if (hz < min) continue
+    if (hz > max) break
+    const pos = freqAxis(hz, min, max, log)
+    if (pos - previous < MIN_LINE) continue
+    previous = pos
+    found.push({ pos, root: degreeOf(tuning, midi, settings.root) === 0, hz, midi })
+  }
+
+  /**
+   * What to write against a note.
+   *
+   * A twelve-tone scale wears the keyboard's names however far its tuning has moved them, since
+   * the key is still the key. A scale that is not twelve to the octave has no keyboard to borrow
+   * from, so only its period roots are named, and named for the octave they open — nineteen steps
+   * up from middle C is still the C above it, whatever MIDI number the step landed on. A scale
+   * with no octave in it has neither, and its roots are given their frequency, which is the one
+   * thing that is true of them.
+   */
+  const name = (note: { midi: number; hz: number; root: boolean }): string => {
+    if (twelve) return noteName(note.midi)
+    if (!octaves) return formatHz(note.hz)
+    return noteName(settings.root + 12 * Math.floor((note.midi - settings.root) / count))
+  }
+
+  const roots = found.filter((note) => note.root).length
+  let labelled = -Infinity
+  return found.map((note) => {
+    const worth = roots > 1 ? note.root : twelve
+    if (!worth || note.pos - labelled < MIN_LABEL) return { pos: note.pos, root: note.root }
+    labelled = note.pos
+    return { pos: note.pos, root: note.root, label: name(note) }
+  })
+}
+
 function niceStep(range: number, target: number): number {
   const raw = range / Math.max(target, 1)
   const mag = Math.pow(10, Math.floor(Math.log10(raw)))
@@ -88,6 +158,8 @@ export function buildGraticule(
 ): Graticule {
   const lines: GridLine[] = []
   const ticks: AxisTick[] = []
+  /** Both frequency axes are divided the same way, whichever way that is. */
+  const notes = config.tuning.mode === 'note'
   const push = (pos: number, horizontal: boolean, major: boolean, label?: string) => {
     if (!(pos >= 0 && pos <= 1)) return
     lines.push({ pos, horizontal, weight: major ? 1 : 0.42, width: major ? 1.25 : 1 })
@@ -118,7 +190,11 @@ export function buildGraticule(
   if (mode === 'spectrum') {
     const { freqMin, freqMax, logFrequency, dbMin, dbMax } = config.spectrum
     const fMax = Math.min(freqMax, nyquist)
-    if (logFrequency) {
+    if (notes) {
+      for (const note of noteLines(config, freqMin, fMax, logFrequency)) {
+        push(note.pos, false, note.root, note.label)
+      }
+    } else if (logFrequency) {
       for (const { f, major } of decadeFrequencies(freqMin, fMax)) {
         push(freqAxis(f, freqMin, fMax, true), false, major, major ? formatHz(f) : undefined)
       }
@@ -139,9 +215,13 @@ export function buildGraticule(
   if (mode === 'spectrogram') {
     const { freqMin, freqMax, logFrequency, historySeconds } = config.spectrogram
     const fMax = Math.min(freqMax, nyquist)
-    if (logFrequency) {
+    if (notes) {
+      // Frequency runs bottom to top here, so every position is inverted.
+      for (const note of noteLines(config, freqMin, fMax, logFrequency)) {
+        push(1 - note.pos, true, note.root, note.label)
+      }
+    } else if (logFrequency) {
       for (const { f, major } of decadeFrequencies(freqMin, fMax)) {
-        // Frequency runs bottom to top, so the axis position is inverted.
         push(1 - freqAxis(f, freqMin, fMax, true), true, major, major ? formatHz(f) : undefined)
       }
     } else {

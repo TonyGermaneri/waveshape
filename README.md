@@ -29,7 +29,7 @@ Four visualisations, one capture and transform core, all on screen at once:
 | Pane | What it shows |
 | --- | --- |
 | **Waveform** | Pitch-locked oscilloscope. GPU min/max/RMS envelope when zoomed out, band-limited sinc reconstruction when zoomed in. |
-| **Spectrum** | FFT magnitude with per-pixel bin reduction, peak hold, Welch averaging, eleven windows. |
+| **Spectrum** | FFT magnitude with per-pixel bin reduction, peak hold, Welch averaging, eleven windows. Frequency axis or keyboard axis, in fifteen tunings. |
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
 | **Vectorscope** | Mid/side goniometer or raw Lissajous, as a trace or a sample cloud, with phase correlation. |
 
@@ -99,6 +99,45 @@ generated from one table in `ui/keymap.ts`, so a binding cannot exist without be
 `keymap.test.ts` proves no two of them answer to the same keystroke, and that the whole table is
 live at once — the property that makes focus unnecessary. Shortcuts are ignored while a control
 has focus, so a slider still takes the arrow keys.
+
+---
+
+## Tunings
+
+Both frequency axes can be ruled in notes instead of hertz — **Appearance ▸ Graticule ▸ Scale
+mode** — which puts a line on every degree of the scale, a brighter one on every root, and the
+name of the note on the axis. A partial then reads against the note it belongs to instead of
+being converted in your head, and the pitch in the readout bar comes back as `A4 +3¢` rather
+than `442.55 Hz`.
+
+Fifteen tunings ship with it, and every one is **computed from its definition rather than copied
+from a table of cents**. A well temperament is not twelve numbers, it is a rule about how far
+each fifth in the chain falls short of pure; the numbers are what that rule produces, and a
+table of them is the same thing with the reasoning thrown away and a transcription error waiting
+to happen. Werckmeister said *narrow four of the fifths by a quarter of the Pythagorean comma* —
+that is what `dsp/tunings.ts` says, and `tuning.test.ts` checks the twelve cents that come out of
+it against the values Kyle Gann and Wikipedia publish, to the last figure they quote.
+
+| | |
+| --- | --- |
+| **Equal** | 12-tone equal temperament |
+| **Historical** | Pythagorean · quarter-comma and sixth-comma meantone · Werckmeister III · Kirnberger III · Vallotti · Young II |
+| **Just** | 5-limit just intonation · the 8th to 16th harmonics as a scale |
+| **Equal divisions** | 19 · 24 · 31 · 53 |
+| **No octave at all** | Bohlen-Pierce: thirteen equal steps of a *twelfth* |
+
+Concert pitch is a slider, and the root note is a menu — equal temperament does not care which
+key it starts on and every historical temperament does, because the point of one is that the
+keys are *not* alike.
+
+**AnaMark tuning files import**, to version 2.00 of the specification: `[Exact Tuning]` where
+there is one and `[Tuning]` otherwise, the file's own base frequency folded in, and the
+specification's completion rule, which is what lets a file stop at the top of one period and have
+every key above it repeat. A file's concert pitch comes with it, unrounded. A periodic tuning is
+recognised as its period — twelve degrees to the octave rather than a hundred and twenty-eight
+numbers — and one that repeats nowhere, a stretched piano curve being the everyday example, keeps
+its table key by key and is continued past the ends of the keyboard at the stretch it finishes
+with. Imported tunings are saved with the profile.
 
 ---
 
@@ -347,6 +386,13 @@ horizontal divisions are squared up against the aspect ratio instead, which is w
 gain be read off the picture: turn it up and the figure grows past its own reference, exactly as
 it does on a scope whose graticule is painted on the glass.
 
+**A readout that resizes itself is a readout that slides under the eye.** Every field in the bar
+along the bottom carries the width of the widest reading it can produce and holds it whatever it
+is currently showing, because the numbers that move most are exactly the ones being watched —
+and a figure gaining a digit should not shove the eleven fields after it sideways. Slots are kept
+rather than removed for the same reason: the pitch of a silent signal reads as a dash, where
+dropping the pair would shunt half the bar left every time the room went quiet.
+
 **A hairline is only whole where it is centred.** Multisampling evaluates a fragment at the
 pixel's centre, so a one-pixel graticule line lying exactly on the boundary between two pixels
 is evaluated at both their centres — which are precisely its own two edges, where its analytic
@@ -451,7 +497,7 @@ transfer and the System tab says so — but the audio thread is no longer alloca
 ```
 src/
   audio/    ring buffer, AudioWorklet producer, capture engine
-  dsp/      windows, reference FFT, biquads, BS.1770-4 loudness, tests
+  dsp/      windows, reference FFT, biquads, BS.1770-4 loudness, tunings, tests
   gpu/      device init, compute orchestration, render passes
     shaders/  WGSL: prepare, fft, unpack, analyze, envelope, nsdf, speccols, draw_*, post
   ui/       tabbed overlay, quad layout, panel placement, controls, keyboard map, themes, graticule

@@ -16,6 +16,8 @@ import {
   type Config,
 } from '../config.ts'
 import { WINDOWS, windowSpec } from '../dsp/windows.ts'
+import { nearestNote, noteName, parseTun, type TuningImport } from '../dsp/tuning.ts'
+import { allTunings, findTuning } from '../dsp/tunings.ts'
 import { PALETTES, WHEELS } from '../gpu/colormap.ts'
 import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
 import type { GpuInfo } from '../gpu/device.ts'
@@ -192,6 +194,7 @@ export class Overlay {
   private readonly panel: HTMLElement
   private readonly frameLayer: HTMLElement
   private readonly dockHint: HTMLElement
+  private readonly tuningPicker: HTMLInputElement
   private readonly grips = new Map<ResizeEdge, HTMLElement>()
   private drag: PanelDrag | null = null
   /** Last geometry written, so a per-frame call can leave the DOM alone when nothing moved. */
@@ -368,6 +371,14 @@ export class Overlay {
     // window it is in, or one docked to an edge that has moved under it.
     window.addEventListener('resize', () => this.applyFrame())
 
+    // Its own picker rather than the one the audio source uses: they accept different files and
+    // a shared one would have to be told which question it was answering.
+    this.tuningPicker = document.createElement('input')
+    this.tuningPicker.type = 'file'
+    this.tuningPicker.accept = '.tun,.msf,.txt,text/plain'
+    this.tuningPicker.className = 'ws-hidden'
+    this.tuningPicker.addEventListener('change', () => void this.importTuning())
+
     this.readout = document.createElement('div')
     this.readout.className = 'ws-readout'
 
@@ -381,6 +392,7 @@ export class Overlay {
       this.frameLayer,
       this.readout,
       this.toast,
+      this.tuningPicker,
     )
 
     this.applyFrame()
@@ -948,43 +960,60 @@ export class Overlay {
    * signal read as a dash, because dropping the pair would shunt half the bar to the left every
    * time the room went quiet.
    */
+  /**
+   * The detected pitch, in whatever the axes are being ruled in. In note mode that is the note
+   * itself and how far the signal is from it — which is the reading a musician wanted from a
+   * pitch detector in the first place, and is only meaningful once there is a tuning to be sharp
+   * or flat *of*.
+   */
+  private pitchReading(hz: number): string {
+    const t = this.deps.config.tuning
+    if (t.mode !== 'note') return `${hz.toFixed(2)} Hz`
+    const { midi, cents } = nearestNote(findTuning(t.imported, t.id), hz, t)
+    return `${noteName(midi)} ${cents >= 0 ? '+' : '−'}${Math.abs(cents).toFixed(0)}¢`
+  }
+
   private readoutItems(s: OverlayStatus): HTMLElement[] {
-    const items: [string, string][] = []
+    /** [key, value, characters the value is given]. */
+    const items: [string, string, number][] = []
     const e = s.engine
-    const source = !e.running
-      ? e.sourceLabel.slice(0, 28)
-      : e.suspended
-        ? 'held — click to start audio'
-        : e.sourceLabel.slice(0, 28)
-    items.push(['src', source])
-    items.push(['rate', e.sampleRate ? `${(e.sampleRate / 1000).toFixed(1)} kHz` : '—'])
-    items.push(['fft', `${this.deps.config.analysis.fftSize}`])
-    items.push(['\u0394f', `${s.binHz.toFixed(2)} Hz`])
-    items.push(['enbw', `${s.enbwHz.toFixed(2)} Hz`])
-    items.push(['rate/s', `${s.analysisFps.toFixed(0)}`])
+    const source = e.running && e.suspended ? 'held — click to start' : e.sourceLabel.slice(0, 22)
+    items.push(['src', source, 22])
+    items.push(['rate', e.sampleRate ? `${(e.sampleRate / 1000).toFixed(1)} kHz` : '—', 9])
+    items.push(['fft', `${this.deps.config.analysis.fftSize}`, 5])
+    items.push(['Δf', `${s.binHz.toFixed(2)} Hz`, 10])
+    items.push(['enbw', `${s.enbwHz.toFixed(2)} Hz`, 10])
+    items.push(['rate/s', `${s.analysisFps.toFixed(0)}`, 4])
     // The pitch estimate only drives the oscilloscope's trigger, so it is only worth the space
     // in the readout while that pane is open.
-    if (this.deps.config.panes.wave && s.pitchHz > 0) {
-      items.push(['pitch', `${s.pitchHz.toFixed(2)} Hz`])
-      items.push(['clarity', s.clarity.toFixed(2)])
+    if (this.deps.config.panes.wave) {
+      items.push(['pitch', s.pitchHz > 0 ? this.pitchReading(s.pitchHz) : '—', 12])
+      items.push(['clarity', s.pitchHz > 0 ? s.clarity.toFixed(2) : '—', 4])
     }
     const l = s.loudness
     if (l) {
-      const num = (v: number) => (Number.isFinite(v) ? v.toFixed(1) : '\u2212\u221e')
-      items.push(['M', num(l.momentary)])
-      items.push(['S', num(l.shortTerm)])
-      items.push(['I', num(l.integrated)])
-      items.push(['LRA', l.range.toFixed(1)])
-      items.push(['dBTP', num(l.truePeakDb)])
-      items.push(['corr', l.correlation.toFixed(2)])
+      const num = (v: number) => (Number.isFinite(v) ? v.toFixed(1) : '−∞')
+      items.push(['M', num(l.momentary), 6])
+      items.push(['S', num(l.shortTerm), 6])
+      items.push(['I', num(l.integrated), 6])
+      items.push(['LRA', l.range.toFixed(1), 5])
+      items.push(['dBTP', num(l.truePeakDb), 6])
+      items.push(['corr', l.correlation.toFixed(2), 5])
     }
-    items.push(['fps', s.fps.toFixed(0)])
-    if (s.dropped > 0) items.push(['dropped', String(s.dropped)])
+    items.push(['fps', s.fps.toFixed(0), 3])
+    // Last in the row, so it can come and go without moving anything but itself.
+    if (s.dropped > 0) items.push(['dropped', String(s.dropped), 0])
 
-    return items.map(([k, v]) => {
+    return items.map(([key, value, width]) => {
       const node = document.createElement('span')
       node.className = 'ws-stat'
-      node.innerHTML = `<em>${k}</em>${v}`
+      const name = document.createElement('em')
+      name.textContent = key
+      const reading = document.createElement('span')
+      reading.className = 'ws-stat-value'
+      reading.textContent = value
+      if (width > 0) reading.style.minWidth = `${width}ch`
+      node.append(name, reading)
       return node
     })
   }
@@ -3013,7 +3042,136 @@ export class Overlay {
         },
         format: fmt.pct,
       },
+      {
+        kind: 'select',
+        label: 'Scale mode',
+        options: [
+          { value: 'frequency', label: 'Frequency' },
+          { value: 'note', label: 'Keyboard note' },
+        ],
+        get: () => c.tuning.mode,
+        set: (v) => {
+          c.tuning.mode = v as typeof c.tuning.mode
+        },
+        hint: 'What divides the two frequency axes — the spectrum’s and the spectrogram’s. Frequency rules them in decades, at 1, 2 and 5. Keyboard note rules them at the pitches of the tuning below, so a partial can be read against the note it belongs to rather than converted in your head.',
+      },
+      ...this.tuningControls(c),
     ]
+  }
+
+  /**
+   * The tuning, which only decides anything while the axes are ruled in notes — so the whole
+   * block is disabled rather than hidden when they are not. Hiding it would make the scale mode
+   * switch reveal six controls, and a panel that changes height under the pointer is a panel
+   * that moves the thing you were about to click.
+   */
+  private tuningControls(c: Config): Control[] {
+    const t = c.tuning
+    const off = () => t.mode !== 'note'
+    const tuning = findTuning(t.imported, t.id)
+    const imported = tuning.source === 'imported'
+    const shape =
+      tuning.kind === 'map'
+        ? 'a key-by-key table, which does not repeat'
+        : `${tuning.degrees.length} degrees to ${Math.abs(tuning.period - 1200) < 1e-6 ? 'the octave' : `${tuning.period.toFixed(1)} cents`}`
+    return [
+      { kind: 'heading', text: 'Tuning' },
+      {
+        kind: 'select',
+        label: 'System',
+        options: allTunings(t.imported).map((entry) => ({ value: entry.id, label: entry.label })),
+        get: () => tuning.id,
+        set: (v) => {
+          t.id = v
+        },
+        disabled: off,
+        hint: tuning.note,
+      },
+      { kind: 'note', text: `${tuning.label} — ${shape}.` },
+      {
+        kind: 'slider',
+        label: 'Concert pitch',
+        min: 380,
+        max: 500,
+        step: 0.1,
+        get: () => t.referenceHz,
+        set: (v) => {
+          t.referenceHz = v
+        },
+        format: (v) => `A4 = ${v.toFixed(1)} Hz`,
+        disabled: off,
+        hint: 'The one frequency every tuning is nailed to. Everything else in the scale is a ratio from here, so moving this moves the whole graticule together.',
+      },
+      {
+        kind: 'select',
+        label: 'Root note',
+        options: Array.from({ length: 12 }, (_, i) => ({
+          value: String(60 + i),
+          label: noteName(60 + i).replace('4', ''),
+        })),
+        get: () => String(60 + (((t.root - 60) % 12) + 12) % 12),
+        set: (v) => {
+          t.root = Number(v)
+        },
+        disabled: off,
+        hint: 'Which key the scale’s first degree sits on. Equal temperament does not care; every historical temperament does, because its point is that the keys are not alike — moving the root moves which of them are the sweet ones.',
+      },
+      {
+        kind: 'button',
+        label: 'Import a .tun file…',
+        action: 'import-tuning',
+        onClick: () => this.tuningPicker.click(),
+        hint: 'AnaMark tuning files, to version 2.00 of the specification: a table of cents for every key, and the concert pitch it was written at, which is adopted along with it. Periodic scales are recognised as such; a stretched tuning that repeats nowhere is kept key by key. Imported tunings are saved with the profile.',
+      },
+      ...(imported
+        ? [
+            {
+              kind: 'button' as const,
+              label: `Forget ${tuning.label}`,
+              action: 'forget-tuning',
+              onClick: () => this.forgetTuning(tuning.id),
+            },
+          ]
+        : []),
+    ]
+  }
+
+  /** Reads a picked .tun file into the profile and switches to it. */
+  private async importTuning(): Promise<void> {
+    const file = this.tuningPicker.files?.[0]
+    // Cleared so that picking the same file twice fires the change event twice.
+    this.tuningPicker.value = ''
+    if (!file) return
+    let parsed: TuningImport | null = null
+    try {
+      parsed = parseTun(await file.text(), file.name.replace(/\.[^.]+$/, ''))
+    } catch {
+      parsed = null
+    }
+    if (!parsed) {
+      this.notify(`${file.name} has no tuning table in it`)
+      return
+    }
+    const t = this.deps.config.tuning
+    t.imported = [...t.imported.filter((entry) => entry.id !== parsed.tuning.id), parsed.tuning]
+    t.id = parsed.tuning.id
+    // A file carries its own concert pitch, and importing one is a request to see it as written —
+    // to the precision it was written at, so the value is clamped into the slider's range but not
+    // rounded to its step. A tenth of a hertz at A4 is a fifth of a cent everywhere.
+    t.referenceHz = Math.min(500, Math.max(380, parsed.referenceHz))
+    // Nothing visible would happen otherwise, which reads as the import having failed.
+    t.mode = 'note'
+    this.deps.onChange()
+    this.rebuild()
+    this.notify(`Tuning  ${parsed.tuning.label}  ·  A4 = ${t.referenceHz.toFixed(1)} Hz`)
+  }
+
+  private forgetTuning(id: string): void {
+    const t = this.deps.config.tuning
+    t.imported = t.imported.filter((entry) => entry.id !== id)
+    if (t.id === id) t.id = DEFAULT_CONFIG.tuning.id
+    this.deps.onChange()
+    this.rebuild()
   }
 
   private systemControls(c: Config): Control[] {

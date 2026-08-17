@@ -7,6 +7,7 @@
 import type { GeneratorKind, SourceKind } from './audio/engine.ts'
 import type { WindowId } from './dsp/windows.ts'
 import type { PanelPlacement } from './ui/dock.ts'
+import type { TuningSettings } from './dsp/tuning.ts'
 
 export type Mode = 'wave' | 'spectrum' | 'spectrogram' | 'vector'
 
@@ -171,6 +172,14 @@ export interface Config {
     /** Brightness of the figure, on top of the theme's intensity. */
     brightness: number
   }
+  /**
+   * What the frequency axes are labelled in, and the scale that decides where the notes are.
+   *
+   * Not in `style`, though the switch for it sits with the graticule controls: a theme carries
+   * the whole of `style`, and picking a different look should not silently retune the instrument.
+   * See `dsp/tuning.ts` for what the fields mean.
+   */
+  tuning: TuningSettings
   meters: {
     targetLufs: number
     truePeakCeilingDb: number
@@ -481,6 +490,13 @@ export const DEFAULT_CONFIG: Config = {
     trace: 'line',
     dotSize: 2,
     brightness: 1,
+  },
+  tuning: {
+    mode: 'frequency',
+    id: 'equal',
+    referenceHz: 440,
+    root: 60,
+    imported: [],
   },
   meters: {
     targetLufs: -14,

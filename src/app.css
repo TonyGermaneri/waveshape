@@ -259,6 +259,16 @@ body {
   margin-right: 5px;
 }
 
+/*
+ * Each reading holds the width of the widest value it can show, set in `ch` from the table in
+ * ui/overlay.ts. Inline-block is what makes a minimum width mean anything on a span, and
+ * tabular figures keep the digits on a common pitch in a face that has proportional ones.
+ */
+.ws-stat-value {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------------------------------------------------------------- panel frame */
 
 /*
