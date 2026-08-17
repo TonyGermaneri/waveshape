@@ -372,6 +372,9 @@ async function main(): Promise<void> {
   void engine.listInputs().then((devices) => overlay.setDevices(devices))
   // Open the input straight away if the browser already trusts us with one.
   void autoStartIfBound()
+  // Same idea for controllers: if MIDI was on last time, reconnect it rather than making the
+  // setting a thing you have to switch on again every session.
+  overlay.restoreMidi()
 
   // ------------------------------------------------------------------ input
   const keyActions: KeyActions = {
@@ -426,6 +429,14 @@ async function main(): Promise<void> {
     // The modal reference owns the keyboard while it is up, including Escape, which the dialog
     // element handles itself.
     if (overlay.isHelpOpen) return
+
+    // A control waiting to hear a knob has first claim on Escape, ahead of hiding the panel —
+    // the way out of a mode should be the key that means "not this", and hiding the panel while
+    // something is still armed would leave it armed with nothing to show for it.
+    if (event.key === 'Escape' && overlay.cancelMidiLearn()) {
+      event.preventDefault()
+      return
+    }
 
     const target = event.target as HTMLElement | null
     if (target) {

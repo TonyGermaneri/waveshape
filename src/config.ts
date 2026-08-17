@@ -130,6 +130,26 @@ export interface Config {
     truePeakCeilingDb: number
   }
   /**
+   * MIDI control. Bindings are keyed by a control's position in the panel — tab, section and
+   * label — because that is stable across reloads and readable in a saved profile, and because
+   * a binding has to outlive the widget it was made on: the widgets for a tab exist only while
+   * that tab is open, and a fader assigned to a Life parameter has to keep working from the
+   * Source tab.
+   */
+  midi: {
+    /** Web MIDI prompts for permission, so nothing is requested until this is turned on. */
+    enabled: boolean
+    /** Input port id, or empty for every input at once. */
+    deviceId: string
+    /**
+     * What drives what. A list rather than a map from id to signal, because `merge` keeps only
+     * keys that exist in the defaults — a dictionary of bindings would be thrown away on every
+     * reload, silently, since the defaults have none of its keys. An array is replaced wholesale
+     * and survives, and it reads better in a stored profile besides.
+     */
+    bindings: { id: string; kind: 'cc' | 'note'; channel: number; number: number }[]
+  }
+  /**
    * The harmonic organism. Every parameter here is a property of a life form rather than of a
    * measurement, which is why they live apart from `analysis` — nothing in this block changes
    * what the signal *is*, only what grows on top of it.
@@ -395,6 +415,11 @@ export const DEFAULT_CONFIG: Config = {
   meters: {
     targetLufs: -14,
     truePeakCeilingDb: -1,
+  },
+  midi: {
+    enabled: false,
+    deviceId: '',
+    bindings: [],
   },
   life: {
     enabled: false,

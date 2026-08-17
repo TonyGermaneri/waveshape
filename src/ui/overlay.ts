@@ -17,6 +17,8 @@ import type { LoudnessReading } from '../dsp/loudness.ts'
 import type { AxisTick } from './axes.ts'
 import { PANE_SPECS, clampSplit, enabledCount, type Layout, type LayoutAxes, type Pane } from './layout.ts'
 import { fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
+import { MidiInput, ALL_INPUTS, signalLabel } from './midi.ts'
+import { MidiBindings, describeId } from './midi-bindings.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
 import { KeyHelp } from './help.ts'
 import { BINDINGS, keyLabel } from './keymap.ts'
@@ -84,6 +86,7 @@ const TABS = [
   'Meters',
   'Theme',
   'Appearance',
+  'MIDI',
   'System',
 ] as const
 type Tab = (typeof TABS)[number]
@@ -132,6 +135,8 @@ export class Overlay {
   private readonly toast: HTMLElement
 
   private readonly help: KeyHelp
+  private readonly midi: MidiBindings
+  private readonly midiInput: MidiInput
   private readonly fullscreenButton: HTMLButtonElement
   private readonly playButton: HTMLButtonElement
   private readonly stopButton: HTMLButtonElement
@@ -167,6 +172,32 @@ export class Overlay {
     this.deps = deps
     this.userThemes = loadUserThemes()
     this.help = new KeyHelp(deps.config)
+
+    // The input is built first because indexing the panel reaches the MIDI tab, which asks the
+    // input whether the browser supports it. Its message handler closes over `this.midi`, which
+    // is resolved when a message arrives rather than now.
+    this.midiInput = new MidiInput({
+      onMessage: (message) => this.midi.handle(message),
+      onPortsChanged: () => this.rebuild(),
+    })
+    this.midi = new MidiBindings({
+      config: deps.config,
+      index: () => this.controlIndex(),
+      onApplied: (structural) => {
+        this.deps.onChange()
+        // A knob sweep is a stream of messages. Refreshing redraws values in place; rebuilding
+        // replaces the DOM, so it is reserved for the discrete controls that can change which
+        // controls exist — the same rule the widget layer uses for a click.
+        if (structural) this.rebuild()
+        else this.refreshControls()
+        this.syncChrome()
+      },
+      onBindingsChanged: () => {
+        this.deps.onChange()
+        this.refreshControls()
+      },
+      onNotice: (text) => this.notify(text),
+    })
 
     this.labelLayer = document.createElement('div')
     this.labelLayer.className = 'ws-labels'
@@ -265,6 +296,25 @@ export class Overlay {
   /** Told once a touch has been seen, so the dismissal hint names a gesture and not a key. */
   noteTouchInput(): void {
     this.touched = true
+  }
+
+  /** Disarms a control that is listening for a binding. True when there was one to disarm. */
+  cancelMidiLearn(): boolean {
+    if (!this.midi.listening) return false
+    this.midi.arm(null)
+    return true
+  }
+
+  /**
+   * Reconnects MIDI if the profile says it was on. Called once the panel exists, because
+   * connecting rebuilds it.
+   *
+   * Permission is per-origin and already granted from last time in the ordinary case, so this
+   * is silent. Where it is not, the browser asks again and a refusal turns the setting back off
+   * rather than leaving it claiming to be on.
+   */
+  restoreMidi(): void {
+    if (this.deps.config.midi.enabled) void this.enableMidi()
   }
 
   setVisible(visible: boolean): void {
@@ -417,9 +467,33 @@ export class Overlay {
     }
   }
 
+  /**
+   * Every control in every tab, tagged with where it lives.
+   *
+   * MIDI bindings resolve through this rather than through the DOM, because only the open tab
+   * has any. Building all ten tabs' descriptors is a few hundred object literals and no layout,
+   * so it is cheap enough to redo whenever the panel is rebuilt.
+   */
+  private controlIndex(): { tab: string; section: string; control: Control }[] {
+    const out: { tab: string; section: string; control: Control }[] = []
+    for (const tab of TABS) {
+      let section = ''
+      const walk = (controls: Control[]) => {
+        for (const control of controls) {
+          if (control.kind === 'heading') section = control.text
+          if (control.kind === 'row') walk(control.children)
+          else out.push({ tab, section, control })
+        }
+      }
+      walk(this.controlsFor(tab))
+    }
+    return out
+  }
+
   /** Rebuilds the active tab's controls. Called on tab change and on structural config change. */
   rebuild(): void {
     const scroll = this.body.scrollTop
+    this.midi.reindex()
     this.refreshControls = renderControls(this.body, this.controlsFor(this.tab), (structural) => {
       this.syncChrome()
       this.deps.onChange()
@@ -431,7 +505,10 @@ export class Overlay {
       } else {
         this.refreshControls()
       }
-    })
+      // Only when MIDI is on. A listen button on all hundred and twenty-one controls is a lot of
+      // furniture for the majority of sessions that will never bind anything, and hiding them
+      // until the feature is switched on means switching it on visibly does something.
+    }, this.deps.config.midi.enabled ? this.midi.ui(() => this.tab) : undefined)
     this.body.scrollTop = scroll
   }
 
@@ -727,6 +804,8 @@ export class Overlay {
         return this.themeControls(c)
       case 'Appearance':
         return this.appearanceControls(c)
+      case 'MIDI':
+        return this.midiControls(c)
       case 'System':
         return this.systemControls(c)
     }
@@ -1704,6 +1783,124 @@ export class Overlay {
         text: 'Every particle carries 58 bits of life beside its 24 bits of colour: which harmonic it is, how many cents sharp, how many siblings it has, how flat its neighbourhood was, whether it was born on a rising edge, its octave, how far reassignment had to move it, its age, its vitality, its cohort, and how many times new energy has renewed it.',
       },
     ]
+  }
+
+  private midiControls(c: Config): Control[] {
+    const m = c.midi
+    const out: Control[] = [
+      {
+        kind: 'note',
+        text: 'Every slider, switch, menu and button in this panel can be driven by a controller. Turn on MIDI, then click the small button beside anything you want to move and touch the knob, fader or key that should move it — whatever arrives is what gets bound. Shift-click a bound button to forget it. Bindings are saved with the profile and keep working whichever tab is open, or none.',
+      },
+      { kind: 'heading', text: 'Device' },
+    ]
+
+    if (!this.midiInput.supported) {
+      out.push({
+        kind: 'note',
+        tone: 'warn',
+        text: 'This browser has no Web MIDI. Chrome and Edge implement it; Safari and Firefox do not, so there is nothing to connect to here.',
+      })
+      return out
+    }
+
+    out.push({
+      kind: 'toggle',
+      label: 'MIDI control',
+      get: () => m.enabled,
+      set: (v) => {
+        m.enabled = v
+        if (v) void this.enableMidi()
+        else this.midiInput.dispose()
+      },
+      hint: 'Web MIDI asks permission the first time, which is why nothing is requested until this is on: an analyser that enumerated your instruments on load would be a rude thing to open.',
+    })
+
+    if (m.enabled && this.midiInput.error) {
+      out.push({ kind: 'note', tone: 'warn', text: this.midiInput.error })
+    }
+
+    if (this.midiInput.available) {
+      const ports = this.midiInput.ports()
+      out.push({
+        kind: 'select',
+        label: 'Input',
+        options: [
+          { value: ALL_INPUTS, label: ports.length ? 'All inputs' : 'All inputs — none connected' },
+          ...ports.map((p) => ({ value: p.id, label: p.name })),
+        ],
+        get: () => m.deviceId,
+        set: (v) => {
+          m.deviceId = v
+          this.midiInput.select(v)
+        },
+        hint: 'One controller is the common case and asking which is a chore, so all inputs at once is the default. Pick a single one when two devices would otherwise fight over the same controller numbers.',
+      })
+      if (!ports.length) {
+        out.push({
+          kind: 'note',
+          text: 'No inputs are connected. Plug one in and it will appear here — the list follows the hardware without a reload.',
+        })
+      }
+    }
+
+    // ---- what is bound -------------------------------------------------------------
+    const bindings = this.midi.list()
+    out.push({ kind: 'heading', text: 'Bindings' })
+    if (this.midi.collisions.length) {
+      out.push({
+        kind: 'note',
+        tone: 'warn',
+        text: `Two controls share a name and cannot both be bound: ${this.midi.collisions
+          .map(describeId)
+          .join(', ')}. This is a fault in the panel rather than anything you did — only the first of them can be driven.`,
+      })
+    }
+    if (!bindings.length) {
+      out.push({
+        kind: 'note',
+        text: 'Nothing bound yet. The listen buttons are on the controls themselves, not here — go to the tab you want, click one, and move something.',
+      })
+      return out
+    }
+
+    const orphans = new Set(this.midi.orphans())
+    for (const { id, signal } of bindings) {
+      const missing = orphans.has(id)
+      out.push({
+        kind: 'readout',
+        label: signalLabel(signal),
+        get: () => (missing ? `${describeId(id)} — no longer exists` : describeId(id)),
+        warn: () => missing,
+      })
+    }
+    out.push({
+      kind: 'button',
+      label: 'Clear all bindings',
+      action: 'midi-clear',
+      onClick: () => this.midi.clearAll(),
+    })
+    if (orphans.size) {
+      out.push({
+        kind: 'note',
+        tone: 'warn',
+        text: 'Some bindings point at controls that are not there. A binding names a control by its tab, section and label, so one made against a different build — or against a source that is not currently selected — can end up with nothing to drive. It will start working again if the control comes back.',
+      })
+    }
+    return out
+  }
+
+  /** Turns MIDI on, and reports rather than swallows a refusal. */
+  private async enableMidi(): Promise<void> {
+    const ok = await this.midiInput.enable()
+    if (ok) {
+      this.midiInput.select(this.deps.config.midi.deviceId)
+      this.notify('MIDI connected')
+    } else {
+      this.deps.config.midi.enabled = false
+      this.notify(this.midiInput.error || 'MIDI was refused')
+    }
+    this.rebuild()
   }
 
   private meterControls(c: Config): Control[] {

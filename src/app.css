@@ -1071,3 +1071,86 @@ body {
     transition: none;
   }
 }
+
+/* ---------------------------------------------------------------------------------------
+ * MIDI learn
+ *
+ * The listen button sits inside rows that are mostly <label>, so it has to stay visually
+ * subordinate to the control it belongs to — small, quiet, and only loud once it is doing
+ * something. Bound and listening are the two states worth seeing across the panel at a glance.
+ * ------------------------------------------------------------------------------------- */
+
+.ws-midi {
+  flex: 0 0 auto;
+  appearance: none;
+  border: 1px solid var(--ws-line);
+  background: transparent;
+  color: var(--ws-text-dim);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  padding: 3px 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  opacity: 0.45;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+/* Reachable by keyboard even while faint, and revealed when the row is under the pointer. */
+.ws-control:hover .ws-midi,
+.ws-field:hover .ws-midi,
+.ws-midi:hover,
+.ws-midi:focus-visible {
+  opacity: 1;
+}
+
+.ws-midi:hover {
+  color: var(--ws-text);
+  border-color: var(--ws-line-strong);
+}
+
+.ws-midi-bound {
+  opacity: 1;
+  color: var(--ws-accent);
+  border-color: color-mix(in srgb, var(--ws-accent) 45%, transparent);
+}
+
+.ws-midi-armed {
+  opacity: 1;
+  color: var(--ws-panel-solid);
+  background: var(--ws-accent);
+  border-color: var(--ws-accent);
+  animation: ws-midi-pulse 1s ease-in-out infinite;
+}
+
+@keyframes ws-midi-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.ws-midi-icon {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
+/* Empty until something is bound, and then it must not push the icon around. */
+.ws-midi-caption:empty {
+  display: none;
+}
+
+/* A row whose only content is a toggle puts its label second, so the button needs pushing out. */
+.ws-control-inline .ws-midi {
+  margin-left: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-midi-armed {
+    animation: none;
+  }
+}

@@ -119,6 +119,29 @@ export interface ControlHandle {
 }
 
 /**
+ * The panel's view of MIDI binding, which is all this module is allowed to know about it.
+ *
+ * Widgets render a listen button and report clicks; what a binding *is*, how it is matched and
+ * what a controller does to a value all live in `midi.ts`. Keeping the seam here means the
+ * control layer has no opinion about MIDI and `midi.ts` has no opinion about the DOM.
+ */
+export interface MidiUi {
+  /**
+   * A stable id for this control, or null if it cannot be bound. `section` is the heading it
+   * sits under, which is what keeps two controls that happen to share a label apart.
+   */
+  bindingId: (control: Control, section: string) => string | null
+  /** What is bound, e.g. "CC 74", or null for nothing yet. */
+  caption: (id: string) => string | null
+  /** True while this control is waiting to hear something. */
+  armed: (id: string) => boolean
+  /** Click: start listening, or stop if already. */
+  toggle: (id: string) => void
+  /** Shift-click: forget the binding. */
+  clear: (id: string) => void
+}
+
+/**
  * Called when a control's value changes. `structural` is true for the discrete controls whose
  * value can change *which* controls exist — picking a different source, toggling a feature
  * that reveals its own settings. Those need the panel rebuilt. Sliders and colour pickers pass
@@ -163,6 +186,69 @@ function labelWith(text: string, keys?: readonly string[]): HTMLElement {
   return span
 }
 
+/**
+ * A label with the listen button pushed to the far end of its line, for the rows that have no
+ * value readout of their own to hang it beside.
+ */
+function headWith(label: HTMLElement, bind: { element: HTMLElement } | null): HTMLElement {
+  if (!bind) return label
+  const head = el('span', 'ws-control-head')
+  head.append(label, bind.element)
+  return head
+}
+
+/**
+ * The listen button: click to bind this control to the next thing that moves.
+ *
+ * Returns null when there is no MIDI layer or the control cannot take a binding, so callers can
+ * append the result unconditionally and rows without one keep their old shape exactly.
+ */
+function midiButton(
+  control: Control,
+  section: string,
+  midi: MidiUi | undefined,
+): { element: HTMLElement; refresh: () => void } | null {
+  if (!midi) return null
+  const id = midi.bindingId(control, section)
+  if (!id) return null
+  const button = el('button', 'ws-midi')
+  button.type = 'button'
+  // A knob seen from the front: a socket with a pointer. Legible at ten pixels, which a five-pin
+  // DIN is not, and it says "something you can turn" rather than naming a protocol.
+  button.innerHTML =
+    '<svg class="ws-midi-icon" viewBox="0 0 12 12" aria-hidden="true" focusable="false">' +
+    '<circle cx="6" cy="6" r="4.5" fill="none" stroke="currentColor" stroke-width="1.2"/>' +
+    '<path d="M6 6 V2.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>' +
+    '</svg>'
+  const caption = el('span', 'ws-midi-caption')
+  button.append(caption)
+  button.addEventListener('click', (event) => {
+    event.preventDefault()
+    // The click has to stop here. Most of these rows are a <label>, and a click anywhere inside
+    // one is forwarded to its input — arming a slider would jump the slider to wherever the
+    // button happens to sit.
+    event.stopPropagation()
+    if (event.shiftKey) midi.clear(id)
+    else midi.toggle(id)
+  })
+  const refresh = () => {
+    const armed = midi.armed(id)
+    const bound = midi.caption(id)
+    button.classList.toggle('ws-midi-armed', armed)
+    button.classList.toggle('ws-midi-bound', !armed && bound !== null)
+    caption.textContent = armed ? 'listening' : (bound ?? '')
+    const label = armed
+      ? 'Move a knob, fader or key to bind it. Click again to stop listening.'
+      : bound
+        ? `Bound to ${bound}. Click to rebind, shift-click to clear.`
+        : 'Click, then move a knob, fader or key to bind it.'
+    button.title = label
+    // The icon alone says nothing to a screen reader, and the caption is a bare "CC 74".
+    button.setAttribute('aria-label', `MIDI binding. ${label}`)
+  }
+  return { element: button, refresh }
+}
+
 const toSlider = (v: number, min: number, max: number, log: boolean): number => {
   if (!log) return (v - min) / (max - min)
   const lo = Math.log(Math.max(min, 1e-6))
@@ -177,7 +263,13 @@ const fromSlider = (t: number, min: number, max: number, log: boolean): number =
   return Math.exp(lo + t * (hi - lo))
 }
 
-export function buildControl(control: Control, onChange: ChangeHandler): ControlHandle {
+export function buildControl(
+  control: Control,
+  onChange: ChangeHandler,
+  midi?: MidiUi,
+  section = '',
+): ControlHandle {
+  const bind = midiButton(control, section, midi)
   switch (control.kind) {
     case 'heading': {
       const node = el('h3', 'ws-heading', control.text)
@@ -189,13 +281,13 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
     }
     case 'row': {
       const node = el('div', 'ws-row')
-      const handles = control.children.map((c) => buildControl(c, onChange))
+      const handles = control.children.map((c) => buildControl(c, onChange, midi, section))
       for (const h of handles) node.append(h.element)
       return { element: node, refresh: () => handles.forEach((h) => h.refresh()) }
     }
     case 'select': {
       const row = el('label', 'ws-control')
-      row.append(labelWith(control.label, control.keys))
+      row.append(headWith(labelWith(control.label, control.keys), bind))
       const select = el('select', 'ws-select')
       for (const option of control.options) {
         const opt = el('option')
@@ -213,6 +305,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
         refresh: () => {
           select.value = control.get()
           select.disabled = control.disabled?.() ?? false
+          bind?.refresh()
         },
       }
     }
@@ -222,6 +315,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
       const valueEl = el('span', 'ws-value')
       const head = el('span', 'ws-control-head')
       head.append(labelEl, valueEl)
+      if (bind) head.append(bind.element)
       const input = el('input', 'ws-slider')
       input.type = 'range'
       const log = control.curve === 'log'
@@ -254,6 +348,7 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
             : String(v)
           valueEl.textContent = format(v)
           input.disabled = control.disabled?.() ?? false
+          bind?.refresh()
         },
       }
     }
@@ -266,11 +361,13 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
         onChange(true)
       })
       row.append(input, labelWith(control.label, control.keys))
+      if (bind) row.append(bind.element)
       return {
         element: withHint(row, control.hint),
         refresh: () => {
           input.checked = control.get()
           input.disabled = control.disabled?.() ?? false
+          bind?.refresh()
         },
       }
     }
@@ -298,10 +395,21 @@ export function buildControl(control: Control, onChange: ChangeHandler): Control
         control.onClick()
         onChange(true)
       })
+      if (!bind) {
+        return {
+          element: withHint(button, control.hint),
+          refresh: () => {
+            button.disabled = control.disabled?.() ?? false
+          },
+        }
+      }
+      const pair = el('span', 'ws-control-inline')
+      pair.append(button, bind.element)
       return {
-        element: withHint(button, control.hint),
+        element: withHint(pair, control.hint),
         refresh: () => {
           button.disabled = control.disabled?.() ?? false
+          bind.refresh()
         },
       }
     }
@@ -431,9 +539,17 @@ export function renderControls(
   container: HTMLElement,
   controls: Control[],
   onChange: ChangeHandler,
+  midi?: MidiUi,
 ): () => void {
   container.replaceChildren()
-  const handles = controls.map((c) => buildControl(c, onChange))
+  // Headings are what a control's section is: the list is flat, so a control belongs to the last
+  // heading above it. That is also how a binding id stays unique when two sections of the same
+  // tab both have an "Opacity".
+  let section = ''
+  const handles = controls.map((c) => {
+    if (c.kind === 'heading') section = c.text
+    return buildControl(c, onChange, midi, section)
+  })
   for (const h of handles) container.append(h.element)
   const refresh = () => handles.forEach((h) => h.refresh())
   refresh()
