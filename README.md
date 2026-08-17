@@ -11,6 +11,9 @@ npm run dev
 
 Requires WebGPU: Chrome/Edge 113+, Safari 26+, Firefox 141+.
 
+Installs as a PWA and keeps working with the network gone — see
+[Installing it](#installing-it).
+
 ---
 
 ## What it does
@@ -475,10 +478,10 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 The dev and preview servers set them directly. **GitHub Pages cannot set response headers at
-all**, so `public/coi-serviceworker.js` supplies them from a service worker instead: it sits in
-front of every same-origin request and re-issues the response with the headers attached. The
-first load is not yet isolated, so it registers, reloads once, and comes back isolated. It
-no-ops when the server already sends the headers, and it is guarded against reload loops.
+all**, so `public/sw.js` supplies them from a service worker instead: it sits in front of every
+same-origin request and re-issues the response with the headers attached. The first load is not
+yet isolated, so it registers, reloads once, and comes back isolated. It no-ops when the server
+already sends the headers, and it is guarded against reload loops.
 
 Verified against a static server sending no headers at all, at a `/waveshape/` subpath:
 
@@ -489,6 +492,45 @@ System ▸ Shared memory: "SharedArrayBuffer ring (lock-free)"
 
 Without any of this the app still runs — the capture path degrades to a pooled `postMessage`
 transfer and the System tab says so — but the audio thread is no longer allocation-free.
+
+### Installing it
+
+The app is a PWA: `public/manifest.webmanifest` names it and sizes its icons, and the same
+worker that supplies the isolation headers holds the build offline. **System ▸ Installation**
+reports which of the two it is running as and what is actually in Cache Storage, and offers the
+install prompt on browsers that expose one.
+
+One worker, not two, because a scope can only have one — and because anything that served a
+cached response *without* re-attaching COOP and COEP would hand back a document that is no
+longer isolated. The app would then quietly lose the lock-free ring the moment it went offline,
+which is the kind of regression that never shows up until it matters. Every response leaving
+`sw.js`, from network or from cache, goes through the same header pass.
+
+Two caching rules, decided by the shape of the URL:
+
+| URL | Rule | Why |
+| --- | --- | --- |
+| `assets/name-HASH.ext` | cache first | Vite's hash is of the contents. A hit can never be stale. |
+| everything else | network first, cache as fallback | The document, the manifest and the icons keep their names across builds. |
+
+Source maps are never cached — they are large and only devtools asks for them.
+
+The list of files to hold, and the version keying the cache, are stamped into `dist/sw.js` by
+the `precache` plugin in `vite.config.ts` once the build is on disk. The version is a digest of
+every precached byte, which buys three things at once: a build that changed nothing keeps its
+cache, a build that changed anything gets a fresh one and drops the old on activation, and
+`sw.js` itself differs on every real deploy — which is what makes the browser notice there is an
+update to install. In the source the stamp is left `null`, and that is the worker's signal that
+it is running against a dev server and should not cache at all.
+
+Verified at that same `/waveshape/` subpath, with the server then refusing every connection:
+
+```
+offline reload         app loads from cache, all four panes render
+crossOriginIsolated    true      SharedArrayBuffer: available
+deep link with query   falls back to the cached shell
+redeploy               one reload onto the new build, old cache dropped
+```
 
 ---
 
@@ -502,9 +544,14 @@ src/
     shaders/  WGSL: prepare, fft, unpack, analyze, envelope, nsdf, speccols, draw_*, post
   ui/       tabbed overlay, quad layout, panel placement, controls, keyboard map, themes, graticule
   workers/  loudness metering
+public/
+  sw.js     isolation headers and the offline cache, in one worker
+  manifest.webmanifest, icons/
 ```
 
-Zero runtime dependencies. TypeScript, Vite and `@webgpu/types` are the only devDependencies.
+Zero runtime dependencies. TypeScript, Vite, `@webgpu/types` and `@types/node` — the last only
+so the build plugin in `vite.config.ts` can read what it just wrote — are the only
+devDependencies.
 
 ## References
 

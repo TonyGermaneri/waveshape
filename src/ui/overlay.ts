@@ -48,6 +48,14 @@ import { dismissHints, fmt, renderControls, type Control, type SwatchOption } fr
 import { MidiInput, ALL_INPUTS, signalLabel } from './midi.ts'
 import { MidiBindings, describeId } from './midi-bindings.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
+import {
+  canInstall,
+  isInstalled,
+  offlineStatus,
+  onInstallChange,
+  promptInstall,
+  refreshOfflineState,
+} from './install.ts'
 import { KeyHelp } from './help.ts'
 import { BINDINGS, keyLabel } from './keymap.ts'
 import {
@@ -402,6 +410,11 @@ export class Overlay {
       if (this.tab === 'System') this.refreshControls()
     })
     this.syncFullscreenButton()
+    // A rebuild rather than a refresh: whether the app can be installed decides whether the
+    // button is there at all, and that answer arrives whenever the browser feels like it.
+    onInstallChange(() => {
+      if (this.tab === 'System') this.rebuild()
+    })
 
     this.buildTabBar()
     this.rebuild()
@@ -3174,8 +3187,21 @@ export class Overlay {
     this.rebuild()
   }
 
+  /**
+   * Raises the browser's install dialog, and says so either way — a prompt that is dismissed
+   * leaves no trace on the page, so without this the button would simply vanish unexplained.
+   */
+  private async install(): Promise<void> {
+    const accepted = await promptInstall()
+    this.notify(accepted ? 'Installing Waveshape…' : 'Install dismissed')
+    if (accepted) await refreshOfflineState()
+  }
+
   private systemControls(c: Config): Control[] {
     const info = this.deps.gpuInfo
+    // The worker precaches during the load that registers it, so there is no moment this could
+    // be read once and trusted. Asking again on every build of the tab is cheap and always right.
+    void refreshOfflineState()
     // Read live, for the same reason as the meters: these are the numbers you watch while
     // changing something else, and a frozen frame rate is worse than none.
     const engine = () => this.live.engine
@@ -3387,6 +3413,27 @@ export class Overlay {
         label: 'Max storage binding',
         get: () => `${(info.maxStorageBufferBindingSize / (1024 * 1024)).toFixed(0)} MB`,
       },
+      { kind: 'heading', text: 'Installation' },
+      {
+        kind: 'readout',
+        label: 'Running as',
+        get: () => (isInstalled() ? 'an installed app' : 'a browser tab'),
+      },
+      { kind: 'readout', label: 'Offline copy', get: () => offlineStatus() },
+      ...(isInstalled()
+        ? []
+        : [
+            {
+              kind: 'button' as const,
+              label: 'Install Waveshape',
+              action: 'install',
+              onClick: () => void this.install(),
+              disabled: () => !canInstall(),
+              hint: canInstall()
+                ? 'Installs the app in its own window, with no tab strip and no address bar taking a row off the canvas. It is the same build either way — the service worker is already holding it offline.'
+                : 'Only Chromium browsers offer a page an install prompt to raise. Safari installs with Share ▸ Add to Dock, Firefox on Android with the browser menu — and this button lights up here as soon as Chrome or Edge decides the app qualifies.',
+            },
+          ]),
       { kind: 'heading', text: 'Verification' },
       {
         kind: 'button',
