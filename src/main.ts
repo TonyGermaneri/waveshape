@@ -619,7 +619,14 @@ async function main(): Promise<void> {
     const visible = panes.filter((p) => p.visible)
     const graticules = visible.map((pane) => {
       const seconds = pane.css.mode === 'wave' ? waveSeconds : config.wave.timebaseMs / 1000
-      return { pane, seconds, graticule: buildGraticule(pane.css.mode, config, seconds, nyquist) }
+      // The vectorscope's divisions are amplitudes rather than fractions of the pane, so its
+      // graticule has to know the shape of the rectangle it is being drawn into.
+      const aspect = pane.css.width / Math.max(pane.css.height, 1)
+      return {
+        pane,
+        seconds,
+        graticule: buildGraticule(pane.css.mode, config, seconds, nyquist, aspect),
+      }
     })
 
     renderer.render(encoder, {

@@ -100,6 +100,17 @@ fn withSaturation(rgb: vec3<f32>, amount: f32) -> vec3<f32> {
   return max(mix(vec3<f32>(luma), rgb, amount), vec3<f32>(0.0));
 }
 
+/// Moves a pixel coordinate onto the centre of the pixel it lands in.
+///
+/// A hairline is only whole where it is centred. Multisampling evaluates the fragment at the
+/// pixel's centre, so a one-pixel line sitting exactly on the boundary between two pixels is
+/// evaluated at both their centres — which are exactly its two edges, where its own coverage
+/// falls to zero. The line disappears, and only at the sizes where the arithmetic lands on a
+/// whole number, which is what makes it look like a bug in whatever put the line there.
+fn snapToPixel(p: f32) -> f32 {
+  return floor(p) + 0.5;
+}
+
 /// Coverage for a line fragment: 1 at the centre, falling to 0 across the last pixel of width.
 fn lineCoverage(s: f32, width: f32) -> f32 {
   let half = max(width, 1.0) * 0.5;

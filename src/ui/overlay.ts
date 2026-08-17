@@ -8,7 +8,13 @@
  * and is reachable by assistive technology.
  */
 
-import { DEFAULT_CONFIG, FFT_SIZES, SAMPLE_RATES, type Config } from '../config.ts'
+import {
+  DEFAULT_CONFIG,
+  FFT_SIZES,
+  SAMPLE_RATES,
+  VECTOR_MAX_POINTS,
+  type Config,
+} from '../config.ts'
 import { WINDOWS, windowSpec } from '../dsp/windows.ts'
 import { PALETTES, WHEELS } from '../gpu/colormap.ts'
 import type { AudioDeviceInfo, EngineStatus } from '../audio/engine.ts'
@@ -82,6 +88,7 @@ const TABS = [
   'Waveform',
   'Spectrum',
   'Spectrogram',
+  'Vectorscope',
   'Life',
   'Meters',
   'Theme',
@@ -828,6 +835,8 @@ export class Overlay {
         return this.spectrumControls(c)
       case 'Spectrogram':
         return this.spectrogramControls(c)
+      case 'Vectorscope':
+        return this.vectorControls(c)
       case 'Life':
         return this.lifeControls(c)
       case 'Meters':
@@ -1646,6 +1655,134 @@ export class Overlay {
           s.palette = v
         },
         hint: 'All of these rise monotonically in lightness. A rainbow map would invent a bright band in the middle of a smooth ramp and you would read it as a peak.',
+      },
+    ]
+  }
+
+  private vectorControls(c: Config): Control[] {
+    const v = c.vector
+    const loud = () => this.live.loudness
+    return [
+      { kind: 'heading', text: 'Figure' },
+      {
+        kind: 'select',
+        label: 'Plot',
+        options: [
+          { value: 'midside', label: 'Mid / side (rotated 45°)' },
+          { value: 'lissajous', label: 'Lissajous (L against R)' },
+        ],
+        get: () => v.mode,
+        set: (value) => {
+          v.mode = value as typeof v.mode
+        },
+        hint: 'Rotated is the studio goniometer: mono stands up vertically, width spreads sideways, and a channel out of polarity lies flat. Unrotated plots the channels themselves, X against Y, which is the figure an oscilloscope draws in X-Y mode — mono is the rising diagonal there, and inverted polarity the falling one.',
+      },
+      {
+        kind: 'slider',
+        label: 'Gain',
+        keys: this.keysFor('Vertical gain'),
+        min: 0.05,
+        max: 64,
+        step: 0.01,
+        curve: 'log',
+        get: () => v.gain,
+        set: (value) => {
+          v.gain = value
+        },
+        format: (value) => `${value.toFixed(2)}×  (${(20 * Math.log10(value)).toFixed(1)} dB)`,
+        hint: 'At 1× a full-scale correlated signal reaches the reference division. The graticule stays where it is, so this grows the figure past its own reference rather than taking it along — which is what lets a quiet passage be opened up without the divisions ceasing to mean an amplitude.',
+      },
+      {
+        kind: 'slider',
+        label: 'Trace length',
+        min: 1,
+        max: 500,
+        step: 0.5,
+        curve: 'log',
+        get: () => v.traceMs,
+        set: (value) => {
+          v.traceMs = value
+        },
+        // Live, because the point count depends on the capture rate rather than on anything
+        // this panel was built with: the same 40 ms is 1920 points at 48 kHz and 7680 at 192.
+        format: (value) => {
+          const rate = this.live.engine.sampleRate || 48000
+          const wanted = Math.max(2, Math.round((rate * value) / 1000))
+          const stride = Math.max(1, Math.ceil(wanted / VECTOR_MAX_POINTS))
+          const points = Math.min(VECTOR_MAX_POINTS, Math.floor(wanted / stride))
+          return `${fmt.ms(value)}  ·  ${points} pts${stride > 1 ? `  (1 in ${stride})` : ''}`
+        },
+        hint: 'How much audio the figure holds. Short enough and it moves with the music; long enough and it closes into the steady shape a sustained note actually has. Past the point budget the trace is thinned rather than cut short — a shape with every nth sample is still the shape, where half of one is a different figure.',
+      },
+      {
+        kind: 'slider',
+        label: 'Tail fade',
+        min: 0,
+        max: 4,
+        step: 0.01,
+        get: () => v.fade,
+        set: (value) => {
+          v.fade = value
+        },
+        format: (value) => (value <= 0.001 ? 'even' : value.toFixed(2)),
+        hint: 'Phosphor: the trace brightens towards the newest sample, so the direction of travel is legible instead of the figure being one undifferentiated loop. At 0 every sample is lit the same and the whole shape reads at once.',
+      },
+      { kind: 'heading', text: 'Trace' },
+      {
+        kind: 'select',
+        label: 'Draw as',
+        options: [
+          { value: 'line', label: 'Connected trace' },
+          { value: 'dots', label: 'Sample dots' },
+        ],
+        get: () => v.trace,
+        set: (value) => {
+          v.trace = value as typeof v.trace
+        },
+        hint: 'The connected trace is what a beam does: it draws the path between consecutive samples whether or not the signal went that way. Dots draw only what was measured, so density shows where the signal actually spends its time — and at high frequencies, where the join between samples is a guess, they are the honest picture.',
+      },
+      {
+        kind: 'slider',
+        label: 'Dot size',
+        min: 0.5,
+        max: 12,
+        step: 0.1,
+        get: () => v.dotSize,
+        set: (value) => {
+          v.dotSize = value
+        },
+        format: (value) => `${value.toFixed(1)} px`,
+        disabled: () => v.trace !== 'dots',
+        hint: 'The connected trace takes the theme’s line width instead, on the Appearance tab.',
+      },
+      {
+        kind: 'slider',
+        label: 'Brightness',
+        min: 0,
+        max: 4,
+        step: 0.01,
+        get: () => v.brightness,
+        set: (value) => {
+          v.brightness = value
+        },
+        format: fmt.fixed(2),
+        hint: 'This pane only, over the theme’s own intensity. Everything is drawn additively, so a long trace or a small dot size piles up light in the middle of the figure — this is the knob that puts it back where you want it.',
+      },
+      { kind: 'heading', text: 'Phase' },
+      {
+        kind: 'readout',
+        label: 'Correlation',
+        get: () => (loud()?.correlation ?? 0).toFixed(3),
+        // Bipolar, matching the meter bridge: it grows out of the centre, left for out of
+        // phase and right for in.
+        meter: () => ((loud()?.correlation ?? 0) + 1) / 2,
+        origin: 0.5,
+        warn: () => (loud()?.correlation ?? 0) < 0,
+        hint: 'The same reading as the Meters tab, put next to the picture it explains. +1 is a figure standing straight up, 0 a round cloud, −1 a figure lying on its side — and anything persistently negative will thin out or disappear when the material is folded down to mono.',
+      },
+      {
+        kind: 'note',
+        text: 'The trace is the captured audio itself, not the analysis: it comes straight off the ring buffer at the full sample rate, so nothing here is affected by the FFT size, the window or the hop. The channels analysed setting on the Analysis tab does not reach it either — a goniometer with one channel would have nothing to plot against.',
       },
     ]
   }

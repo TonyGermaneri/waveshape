@@ -83,6 +83,8 @@ export function buildGraticule(
   config: Config,
   timebaseSeconds: number,
   nyquist: number,
+  /** Pane width over height. Only the vectorscope needs it — see below. */
+  aspect = 1,
 ): Graticule {
   const lines: GridLine[] = []
   const ticks: AxisTick[] = []
@@ -156,15 +158,24 @@ export function buildGraticule(
     return { lines, ticks }
   }
 
-  // Vectorscope: centre cross plus the +/-0.707 reference, which is where a full-scale
-  // correlated signal reaches on the rotated mid/side axes.
-  for (const v of [-1, -Math.SQRT1_2, 0, Math.SQRT1_2, 1]) {
-    const p = (v + 1) / 2
+  // Vectorscope: centre cross plus a reference at the amplitude the figure is read against —
+  // ±0.707 rotated, which is where a full-scale correlated signal reaches on the mid/side axes,
+  // and ±0.5 unrotated, where the same signal is simply half way out on each channel.
+  //
+  // The figure is scaled by the pane's *shorter* side so that a circle stays a circle, so on a
+  // pane that is not square the reference is not a fixed fraction of the width. Squaring the
+  // horizontal divisions up here is what keeps the graticule meaning the same thing on both
+  // axes: an amplitude, not a proportion of however wide the pane happens to be.
+  const squeeze = aspect > 1 ? 1 / aspect : 1
+  const stretch = aspect < 1 ? aspect : 1
+  const lissajous = config.vector.mode === 'lissajous'
+  for (const v of [-1, lissajous ? -0.5 : -Math.SQRT1_2, 0, lissajous ? 0.5 : Math.SQRT1_2, 1]) {
     const major = v === 0
-    push(p, true, major)
-    push(p, false, major)
+    push(0.5 + (v * squeeze) / 2, false, major)
+    push(0.5 - (v * stretch) / 2, true, major)
   }
-  ticks.push({ pos: 0.5, horizontal: false, label: 'S' })
-  ticks.push({ pos: 0.5, horizontal: true, label: 'M' })
+  // Unrotated the axes are the channels themselves: X is left, Y is right.
+  ticks.push({ pos: 0.5, horizontal: false, label: lissajous ? 'L' : 'S' })
+  ticks.push({ pos: 0.5, horizontal: true, label: lissajous ? 'R' : 'M' })
   return { lines, ticks }
 }

@@ -19,11 +19,11 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VSO
   var p0: vec2<f32>;
   var p1: vec2<f32>;
   if (line.y < 0.5) {
-    let x = line.x * S.resolution.x;
+    let x = snapToPixel(line.x * S.resolution.x);
     p0 = vec2<f32>(x, 0.0);
     p1 = vec2<f32>(x, S.resolution.y);
   } else {
-    let y = line.x * S.resolution.y;
+    let y = snapToPixel(line.x * S.resolution.y);
     p0 = vec2<f32>(0.0, y);
     p1 = vec2<f32>(S.resolution.x, y);
   }

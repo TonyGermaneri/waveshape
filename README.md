@@ -31,7 +31,7 @@ Four visualisations, one capture and transform core, all on screen at once:
 | **Waveform** | Pitch-locked oscilloscope. GPU min/max/RMS envelope when zoomed out, band-limited sinc reconstruction when zoomed in. |
 | **Spectrum** | FFT magnitude with per-pixel bin reduction, peak hold, Welch averaging, eleven windows. |
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
-| **Vectorscope** | Mid/side goniometer with phase correlation. |
+| **Vectorscope** | Mid/side goniometer or raw Lissajous, as a trace or a sample cloud, with phase correlation. |
 
 `1`–`4` switch a visualisation on and off, and the grid collapses around whatever is left by
 one rule applied twice: **a row with no panes takes no height, and a row with one pane gives it
@@ -73,7 +73,7 @@ related quantity — `o` `p` is the oscilloscope's span, `⇧O` `⇧P` the spect
 | `1` `2` `3` `4` · `\` | Switch a visualisation on or off · reset the layout |
 | `-` `=` · `[` `]` · `q` `w` · `a` `s` | FFT size · hop · window · averaging |
 | `c` `e` `m` | Channels analysed · reassignment · magnitude scale |
-| `↑` `↓` | Vertical gain (oscilloscope and vectorscope) |
+| `↑` `↓` | Vertical gain — oscilloscope and vectorscope together, each keeping its own value |
 | `⇧↑` `⇧↓` | Level window — spectrum and spectrogram together |
 | `←` `→` · `⇧←` `⇧→` | Pan · zoom the frequency range, both panes together |
 | `o` `p` · `⇧O` `⇧P` | Oscilloscope span · spectrogram span |
@@ -317,6 +317,22 @@ aliasing. Zoomed out, each column shows the true min/max of every sample inside 
 straight lines between samples show a shape the signal never had — so the trace becomes the
 Whittaker-Shannon interpolant, which is why a square wave correctly shows Gibbs overshoot
 instead of perfect corners.
+
+**The vectorscope's divisions are amplitudes, not fractions of the pane.** A goniometer figure
+is scaled by the *shorter* side of its pane, because anything else turns a circle into an
+ellipse — so on a pane that is not square the ±1 division is not at the pane's edge, and drawing
+it there would mean the graticule and the trace disagreed about what full scale is. The
+horizontal divisions are squared up against the aspect ratio instead, which is what lets the
+gain be read off the picture: turn it up and the figure grows past its own reference, exactly as
+it does on a scope whose graticule is painted on the glass.
+
+**A hairline is only whole where it is centred.** Multisampling evaluates a fragment at the
+pixel's centre, so a one-pixel graticule line lying exactly on the boundary between two pixels
+is evaluated at both their centres — which are precisely its own two edges, where its analytic
+coverage falls to zero. The line disappears, and only at the sizes where the arithmetic lands on
+a whole number, which is what makes it read as a bug in whatever computed the position rather
+than in how it was drawn. Grid lines are snapped to pixel centres, which fixes it and makes the
+whole graticule crisper besides.
 
 **Rendering is additive and linear.** Everything is drawn into `rgba16float` with additive
 blending, so overlapping traces sum and density becomes brightness the way it does on a

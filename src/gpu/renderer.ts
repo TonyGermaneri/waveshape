@@ -21,7 +21,7 @@
  */
 
 import type { Config, LifeBlend, Mode } from '../config.ts'
-import { channelMix } from '../config.ts'
+import { channelMix, VECTOR_MAX_POINTS } from '../config.ts'
 import { hexToLinearRgb, paletteById, rasterisePalette } from './colormap.ts'
 import type { Analyzer, FrameStats } from './analyzer.ts'
 import type { GridLine } from '../ui/axes.ts'
@@ -221,7 +221,7 @@ export class Renderer {
     this.spectrumParams = [0, 1].map((i) =>
       device.createBuffer({ label: `spectrum-${i}`, size: 16, usage: uni }),
     )
-    this.vectorParams = device.createBuffer({ label: 'vector', size: 32, usage: uni })
+    this.vectorParams = device.createBuffer({ label: 'vector', size: 48, usage: uni })
     // A buffer per scope rather than one reused three times: all three draws are in the same
     // submission, and writeBuffer is ordered ahead of the whole command buffer.
     this.lifeDrawParams = {
@@ -595,7 +595,9 @@ export class Renderer {
         ? frame.config.life.baseOpacity
         : 1
     f[21] = s.intensity * fadeBase
-    f[22] = mode === 'wave' || mode === 'vector' ? frame.config.wave.gain : 1
+    // The vectorscope's own gain rides in its parameter block instead, where the rest of its
+    // geometry already is; this slot stays at unity for it.
+    f[22] = mode === 'wave' ? frame.config.wave.gain : 1
     f[23] = mode === 'spectrum' ? frame.config.spectrum.fill : 1
 
     if (mode === 'spectrum') {
@@ -842,11 +844,14 @@ export class Renderer {
   private drawVector(pass: GPURenderPassEncoder, frame: RenderFrame, pane: RenderPane): void {
     const audio = this.analyzer.audioBuffer
     if (!audio) return
-    // 40 ms of trace: long enough to close the figure on low-frequency material without
-    // drawing more segments than the display can resolve.
-    const wanted = Math.round(frame.stats.sampleRate * 0.04)
-    const decimation = Math.max(1, Math.ceil(wanted / 8192))
-    const count = Math.min(8192, Math.floor(wanted / decimation))
+    const v = frame.config.vector
+    // A longer trace than the cap is thinned rather than cut short: the figure a goniometer
+    // draws is a shape, and half a shape is a different one. Every nth sample keeps the whole
+    // of it and gives up only the detail between the points.
+    const dots = v.trace === 'dots'
+    const wanted = Math.max(2, Math.round((frame.stats.sampleRate * v.traceMs) / 1000))
+    const decimation = Math.max(1, Math.ceil(wanted / VECTOR_MAX_POINTS))
+    const count = Math.min(VECTOR_MAX_POINTS, Math.floor(wanted / decimation))
 
     const u = this.u32
     const f = this.f32
@@ -854,11 +859,15 @@ export class Renderer {
     u[1] = this.analyzer.ringCapacity
     u[2] = this.analyzer.ringChannels
     u[3] = frame.stats.head >>> 0
-    f[4] = 1
-    f[5] = 0.6
-    f[6] = 0
+    f[4] = v.gain
+    f[5] = v.fade
+    f[6] = v.mode === 'lissajous' ? 1 : 0
     f[7] = decimation
-    this.device.queue.writeBuffer(this.vectorParams, 0, this.scratch, 0, 32)
+    f[8] = dots ? 1 : 0
+    f[9] = v.dotSize
+    f[10] = v.brightness
+    f[11] = 0
+    this.device.queue.writeBuffer(this.vectorParams, 0, this.scratch, 0, 48)
 
     if (!this.vectorBind) {
       this.vectorBind = this.device.createBindGroup({
@@ -872,7 +881,8 @@ export class Renderer {
     }
     pass.setPipeline(this.vectorPipeline)
     pass.setBindGroup(0, this.vectorBind)
-    pass.draw(6, Math.max(1, count - 1))
+    // A dot per sample; a segment per pair of them, so one fewer.
+    pass.draw(6, Math.max(1, dots ? count : count - 1))
   }
 
   /**

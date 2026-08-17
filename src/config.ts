@@ -18,6 +18,12 @@ export type TriggerMode = 'free' | 'level' | 'pitch'
 
 export type TraceMode = 'auto' | 'envelope' | 'bandlimited'
 
+/** How the goniometer plots the pair: rotated into mid and side, or the channels raw. */
+export type VectorMode = 'midside' | 'lissajous'
+
+/** The figure as a connected trace, or as one dot per sample. */
+export type VectorTrace = 'line' | 'dots'
+
 /**
  * Chrome colours. The overlay derives every one of its CSS custom properties from these five
  * values, so a theme restyles the panel as well as the canvas rather than leaving a dark
@@ -133,6 +139,30 @@ export interface Config {
     splatRadius: number
     palette: string
     normalise: boolean
+  }
+  vector: {
+    /**
+     * Radial gain. At 1 a full-scale correlated signal reaches the ±0.707 reference, which is
+     * where the rotation puts it. The graticule stays where it is when this moves, the way a
+     * scope's does: the figure grows past its own reference rather than taking it along.
+     */
+    gain: number
+    mode: VectorMode
+    /**
+     * How much audio the figure holds. Long enough to close the figure on low material, short
+     * enough that it still moves with the music.
+     */
+    traceMs: number
+    /**
+     * Phosphor ramp along the trace: brightness rises as age^fade from the oldest sample to the
+     * newest. Zero lights the whole figure evenly, and larger values leave only the leading edge.
+     */
+    fade: number
+    trace: VectorTrace
+    /** Dot diameter in pixels. The connected trace takes the theme's line width instead. */
+    dotSize: number
+    /** Brightness of the figure, on top of the theme's intensity. */
+    brightness: number
   }
   meters: {
     targetLufs: number
@@ -349,6 +379,13 @@ export const SAMPLE_RATES = [
   192000,
 ] as const
 
+/**
+ * Most points the vectorscope will draw at once. A longer trace than this many samples is
+ * decimated rather than truncated, so the figure keeps its shape and loses only its detail —
+ * and the panel can say so, which is why the cap lives here rather than inside the renderer.
+ */
+export const VECTOR_MAX_POINTS = 8192
+
 export const DEFAULT_SPLIT: LayoutSplit = { x: 0.5, y: 0.5 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -421,6 +458,15 @@ export const DEFAULT_CONFIG: Config = {
     splatRadius: 1.1,
     palette: 'magma',
     normalise: false,
+  },
+  vector: {
+    gain: 1,
+    mode: 'midside',
+    traceMs: 40,
+    fade: 0.6,
+    trace: 'line',
+    dotSize: 2,
+    brightness: 1,
   },
   meters: {
     targetLufs: -14,

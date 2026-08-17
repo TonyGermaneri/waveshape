@@ -3,11 +3,14 @@
 // The studio convention rotates the L/R plane 45 degrees so the axes become mid and side:
 // vertical is (L+R)/sqrt(2), horizontal is (L-R)/sqrt(2). A mono source therefore draws a
 // vertical line, a wide source spreads horizontally, and a polarity-inverted channel collapses
-// to a horizontal line — the three things an engineer is actually looking for.
+// to a horizontal line — the three things an engineer is actually looking for. Turning the
+// rotation off plots the channels raw, X against Y, which is the Lissajous figure an
+// oscilloscope in X-Y mode draws and the form the classic patterns are quoted in.
 //
-// Samples are drawn as a connected trace with alpha rising towards the newest sample, which
-// gives the phosphor-decay look a hardware goniometer has and makes the direction of travel
-// legible.
+// Samples are drawn with alpha rising towards the newest, which gives the phosphor-decay look a
+// hardware goniometer has and makes the direction of travel legible. Joined up they are a trace;
+// left as dots they are the sample cloud itself, which is what the density of the figure — and
+// therefore its distribution — actually looks like.
 
 @group(0) @binding(0) var<uniform> S: Style;
 @group(0) @binding(1) var<storage, read> audio: array<f32>;
@@ -18,11 +21,14 @@ struct VectorParams {
   a: vec4<u32>,
   // x: gain   y: ageFade   z: mode (0 = mid/side, 1 = raw X/Y)   w: decimation
   b: vec4<f32>,
+  // x: dots (0/1)   y: dot diameter px   z: brightness   w: unused
+  c: vec4<f32>,
 }
 
 struct VSOut {
   @builtin(position) pos: vec4<f32>,
-  @location(0) s: f32,
+  // Trace: x runs -1..1 across the segment's width. Dots: both run -1..1 across the quad.
+  @location(0) uv: vec2<f32>,
   @location(1) age: f32,
 }
 
@@ -55,21 +61,37 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) seg: u32) -> VSOu
   let i0 = start + seg * stride;
 
   let p0 = toScreen(samplePoint(i0));
-  let p1 = toScreen(samplePoint(i0 + stride));
-  let sv = segmentVertex(p0, p1, S.geom.x, vi, S.resolution.xy);
 
   var out: VSOut;
-  out.pos = sv.pos;
-  out.s = sv.s;
+  if (V.c.x > 0.5) {
+    // One square quad per sample, centred on the point; the fragment stage rounds it off.
+    let corner = (quadCorner(vi) - 0.5) * 2.0;
+    let radius = max(V.c.y, 1.0) * 0.5;
+    out.pos = toNdc(p0 + corner * radius, S.resolution.xy);
+    out.uv = corner;
+  } else {
+    let p1 = toScreen(samplePoint(i0 + stride));
+    let sv = segmentVertex(p0, p1, S.geom.x, vi, S.resolution.xy);
+    out.pos = sv.pos;
+    out.uv = vec2<f32>(sv.s, sv.t);
+  }
   out.age = f32(seg) / f32(max(count - 1u, 1u));
   return out;
 }
 
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4<f32> {
-  let cov = lineCoverage(in.s, S.geom.x);
+  var cov: f32;
+  if (V.c.x > 0.5) {
+    // Radial falloff over the outermost pixel, so a dot is a disc rather than the square it
+    // was drawn as, and a one-pixel dot is a point rather than nothing.
+    let radius = max(V.c.y, 1.0) * 0.5;
+    cov = clamp((1.0 - length(in.uv)) * radius, 0.0, 1.0);
+  } else {
+    cov = lineCoverage(in.uv.x, S.geom.x);
+  }
   // Newest samples are brightest; V.b.y controls how quickly the tail falls away.
   let fade = pow(in.age, max(V.b.y, 0.0001));
-  let a = S.primary.a * S.geom.y * cov * fade;
+  let a = S.primary.a * S.geom.y * V.c.z * cov * fade;
   return vec4<f32>(S.primary.rgb * a, a);
 }

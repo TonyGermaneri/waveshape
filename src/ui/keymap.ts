@@ -253,6 +253,8 @@ const MODE_LABELS: Record<Mode, string> = {
 /** Prints one value when both panes agree, and both when they have been pulled apart. */
 const agree = (a: string, b: string): string => (a === b ? a : `${a}  ·  ${b}`)
 
+const gainText = (v: number): string => `${v.toFixed(2)}×  (${(20 * Math.log10(v)).toFixed(1)} dB)`
+
 export const BINDINGS: readonly Binding[] = [
   // ------------------------------------------------------------------------------ panel
   {
@@ -409,23 +411,22 @@ export const BINDINGS: readonly Binding[] = [
   //
   // Nothing here asks which pane you meant. Where a control belongs to one visualisation it has
   // a key of its own; where two of them share an axis, one key moves both.
-  number_({
+  {
     keys: [
       { token: 'arrowup', arg: 1 },
       { token: 'arrowdown', arg: -1 },
     ],
     label: 'Vertical gain',
     group: 'Display',
-    detail: 'Drives the oscilloscope and the vectorscope, which share one gain.',
-    get: (c) => c.wave.gain,
-    set: (c, v) => {
-      c.wave.gain = v
+    detail:
+      'The oscilloscope and the vectorscope together — both are a deflection off a centre line. Each keeps its own value, so a ratio set between them survives the key.',
+    run: (ctx, arg) => {
+      const step = (v: number) => clamp(v * Math.pow(1.15, arg), 0.05, 64)
+      ctx.config.wave.gain = step(ctx.config.wave.gain)
+      ctx.config.vector.gain = step(ctx.config.vector.gain)
+      return `Vertical gain  ${agree(gainText(ctx.config.wave.gain), gainText(ctx.config.vector.gain))}`
     },
-    min: 0.05,
-    max: 64,
-    factor: 1.15,
-    format: (v) => `${v.toFixed(2)}×  (${(20 * Math.log10(v)).toFixed(1)} dB)`,
-  }),
+  },
   {
     keys: [
       { token: 'shift+arrowup', arg: 1 },
