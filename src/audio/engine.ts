@@ -14,6 +14,8 @@
  */
 
 import { AudioRing } from './ring.ts'
+import { containerSampleRate } from './container.ts'
+import { RING_CAPACITY } from '../gpu/limits.ts'
 import captureWorkletUrl from './capture-worklet.ts?worker&url'
 
 export type SourceKind = 'microphone' | 'display' | 'file' | 'generator'
@@ -56,9 +58,19 @@ export interface EngineStatus {
   sourceLabel: string
   sampleRate: number
   channels: number
-  /** True when the AudioContext rate matches the capture device — no hidden resampling. */
+  /**
+   * True when the AudioContext rate matches the source's own — no hidden resampling. Only
+   * meaningful when `sourceRateKnown` is true; false-and-unknown means "could not check", which
+   * is a different thing from "checked and it does not match".
+   */
   bitPerfectRate: boolean
-  /** Rate the device reported, when it reported one. */
+  /**
+   * Whether the source's own rate could be established at all. Devices report theirs. Files do
+   * not, unless their container says so: `decodeAudioData` resamples to the context rate and
+   * then reports *that*, so an MP3 or an AAC decoded here has no recoverable original rate.
+   */
+  sourceRateKnown: boolean
+  /** Rate the source reported, when it reported one. */
   deviceSampleRate: number | null
   baseLatencySec: number
   outputLatencySec: number
@@ -71,7 +83,6 @@ export interface AudioDeviceInfo {
   label: string
 }
 
-const RING_CAPACITY = 1 << 19 // 524288 frames: 10.9 s at 48 kHz, 2.7 s at 192 kHz
 
 /**
  * Resume a context without the possibility of hanging on it.
@@ -110,6 +121,7 @@ export class AudioEngine {
     sampleRate: 0,
     channels: 0,
     bitPerfectRate: true,
+    sourceRateKnown: true,
     deviceSampleRate: null,
     baseLatencySec: 0,
     outputLatencySec: 0,
@@ -209,9 +221,24 @@ export class AudioEngine {
       label = track.label || (request.kind === 'display' ? 'Tab / system audio' : 'Microphone')
     }
 
-    // Match the context to the device so no resampler is inserted.
+    // A file's bytes are read, and its header parsed, *before* the context exists. It has to be
+    // this way round: `decodeAudioData` resamples to whatever rate the context is already
+    // running at and the AudioBuffer then reports that rate back, so asking the decoded buffer
+    // what rate the file was is asking the resampler what it resampled to. The answer was always
+    // "the same", and the bit-perfect indicator was reporting agreement with itself.
+    let fileBytes: ArrayBuffer | null = null
+    let fileRate: number | null = null
+    if (request.kind === 'file' && request.file) {
+      fileBytes = await request.file.arrayBuffer()
+      fileRate = containerSampleRate(fileBytes)
+    }
+
+    // Match the context to the source so no resampler is inserted. An explicitly chosen rate
+    // still wins over the file's: asking for 44.1 and getting the file's 96 would be the same
+    // silent substitution in the other direction.
     const desired =
-      deviceRate ?? (request.sampleRate === 'native' ? undefined : request.sampleRate)
+      deviceRate ??
+      (request.sampleRate !== 'native' ? request.sampleRate : (fileRate ?? undefined))
     this.context = await this.createContext(desired)
     const ctx = this.context
 
@@ -221,16 +248,17 @@ export class AudioEngine {
       const src = ctx.createMediaStreamSource(this.stream)
       channels = Math.min(request.channels, Math.max(1, src.channelCount))
       this.sourceNode = src
-    } else if (request.kind === 'file' && request.file) {
-      const bytes = await request.file.arrayBuffer()
-      this.fileBuffer = await ctx.decodeAudioData(bytes)
+    } else if (request.kind === 'file' && request.file && fileBytes) {
+      this.fileBuffer = await ctx.decodeAudioData(fileBytes)
       const player = ctx.createBufferSource()
       player.buffer = this.fileBuffer
       player.loop = true
       player.start()
       this.sourceNode = player
       channels = this.fileBuffer.numberOfChannels
-      deviceRate = this.fileBuffer.sampleRate
+      // The container's rate, not the decoded buffer's. The buffer's is the context's by
+      // definition and comparing it against the context proves nothing.
+      deviceRate = fileRate
       label = `${request.file.name}`
     } else if (request.kind === 'generator' && request.generator) {
       const { node, description } = this.buildGenerator(ctx, request.generator)
@@ -292,7 +320,12 @@ export class AudioEngine {
       this.setStatus({ ...this.status, suspended: ctx.state !== 'running' })
     }
 
-    const bitPerfect = deviceRate === null || Math.abs(deviceRate - ctx.sampleRate) < 1
+    // A generator or a stream with no reported rate is native by construction — it is generated
+    // at, or negotiated to, the context's rate, and there is nothing behind it to disagree with.
+    // A file whose container did not name a rate is the one case that is genuinely unknown.
+    const unknownFileRate = request.kind === 'file' && fileRate === null
+    const bitPerfect =
+      !unknownFileRate && (deviceRate === null || Math.abs(deviceRate - ctx.sampleRate) < 1)
     this.setStatus({
       running: true,
       suspended: ctx.state !== 'running',
@@ -300,13 +333,16 @@ export class AudioEngine {
       sampleRate: ctx.sampleRate,
       channels,
       bitPerfectRate: bitPerfect,
+      sourceRateKnown: !unknownFileRate,
       deviceSampleRate: deviceRate,
       baseLatencySec: ctx.baseLatency ?? 0,
       outputLatencySec: ctx.outputLatency ?? 0,
       sharedMemory: usingSharedMemory,
       message: bitPerfect
         ? ''
-        : `Device runs at ${deviceRate} Hz but the AudioContext is at ${ctx.sampleRate} Hz — the browser is resampling.`,
+        : unknownFileRate
+          ? `This container does not state its sample rate, and decoding resamples to the AudioContext's ${ctx.sampleRate} Hz — so whether anything was resampled cannot be checked. WAV, FLAC, AIFF and Ogg do state it.`
+          : `Source runs at ${deviceRate} Hz but the AudioContext is at ${ctx.sampleRate} Hz — the browser is resampling.`,
     })
   }
 

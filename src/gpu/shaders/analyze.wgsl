@@ -34,10 +34,12 @@ struct Params {
   a: vec4<u32>,
   // x: displayChannel   y: reassign (0/1)   z: totalThreads   w: n
   b: vec4<u32>,
-  // x: ampScale   y: peakDecayPerBatch   z: avgAlpha   w: floorDb
+  // x: ampScale   y: peakDecayPerFrame   z: avgAlpha   w: floorDb
   c: vec4<f32>,
   // x: sampleRate   y: hop   z: maxTimeShiftSamples   w: maxFreqShiftHz
   d: vec4<f32>,
+  // x: endpointScale
+  e: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -55,14 +57,22 @@ fn binIndex(frame: u32, variant: u32, channel: u32) -> u32 {
   return (frame * variantCount + variant) * channelCount + channel;
 }
 
+// DC and Nyquist appear once in the two-sided spectrum, every other bin appears twice, and
+// `ampScale` carries that factor of two — so both endpoints need it taken back out. *How much*
+// of it depends on what the scale means, and the two answers differ by 3.01 dB.
+//
+//   amplitude   ampScale is 2/S1 and the shader reports a linear amplitude, so the factor of
+//               two is in the quantity itself: halve it.
+//   density     ampScale is sqrt(2/(fs*S2)) and the shader reports the square root of a power
+//               spectral density, so the factor of two is under the root: divide by sqrt(2).
+//
+// Using 0.5 for both left every density-mode DC and Nyquist reading 3.01 dB low.
 fn amplitudeAt(frame: u32, channel: u32, k: u32) -> f32 {
   let stride = P.a.x + 1u;
   let z = bins[binIndex(frame, 0u, channel) * stride + k];
   var mag = length(z) * P.c.x;
-  // DC and Nyquist appear once in the two-sided spectrum, every other bin appears twice;
-  // ampScale carries the factor of two, so undo it at the endpoints.
   if (k == 0u || k == P.a.x) {
-    mag = mag * 0.5;
+    mag = mag * P.e.x;
   }
   return mag;
 }
@@ -90,20 +100,20 @@ fn spectra(@builtin(global_invocation_id) gid: vec3<u32>) {
   let alpha = P.c.z;
   var latest = 0.0;
 
+  // Both integrators advance once per *analysis frame*, inside the loop. A batch is however
+  // many frames happened to arrive between two paints, so decaying and re-arming the hold once
+  // per batch meant two things at once: every transient that did not land on the newest frame
+  // of the batch was discarded, and the decay rate became a function of the display rate. A
+  // peak hold that misses attacks is not a peak hold.
   for (var f = 0u; f < frameCount; f = f + 1u) {
     let amp = amplitudeAt(f, channel, k);
     let power = amp * amp;
     avg = avg + alpha * (power - avg);
+    peak = max(max(peak - P.c.y, floorDb), max(toDb(amp), floorDb));
     latest = amp;
   }
 
-  let latestDb = max(toDb(latest), floorDb);
-  peak = max(peak - P.c.y, floorDb);
-  if (latestDb > peak) {
-    peak = latestDb;
-  }
-
-  spectrum[tid] = latestDb;
+  spectrum[tid] = max(toDb(latest), floorDb);
   peaks[tid] = peak;
   average[tid] = avg;
 }
@@ -129,15 +139,23 @@ fn reassign(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var amp = sqrt(power) * P.c.x;
   if (k == 0u || k == l) {
-    amp = amp * 0.5;
+    amp = amp * P.e.x;
   }
 
   // Time of this frame's window centre, expressed in samples relative to the newest frame.
   var tRel = (f32(frame) - f32(P.a.z - 1u)) * hop;
   var freq = (f32(k) / n) * fs;
-  var valid = 1.0;
 
-  if (P.b.y == 1u && P.a.w >= 3u) {
+  // The slot carries two things at once: below 0.5 the point is not real, and from 0.5 to 1.0
+  // it is how coherent the point is — see the note in the branch below. With reassignment off
+  // there is no coherence measurement to report, and leaving this at 1.0 reported the maximum:
+  // every point in the cloud arrived at the organism claiming to be a perfectly stable partial.
+  // 0.5 is the bottom of the range and still passes every `< 0.5` validity test unchanged, so
+  // the point is still real — its coherence is simply unknown, which is not the same as certain.
+  let reassigning = P.b.y == 1u && P.a.w >= 3u;
+  var valid = select(0.5, 1.0, reassigning);
+
+  if (reassigning) {
     if (power < 1e-24) {
       valid = 0.0;
     } else {

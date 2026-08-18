@@ -32,15 +32,31 @@ export const LIFE0_FIELDS = [
   ['harmonic', 5],
   /** Cents from the exact multiple, signed, biased by 32. */
   ['detune', 6],
-  /** How many other partials share this series, saturating at 31. */
+  /**
+   * How much of the inferred harmonic series was present in the frame this particle was born
+   * in, saturating at 31. A property of the *series*, not of this particle's neighbourhood:
+   * every particle born into the same frame from the same fundamental gets the same number.
+   */
   ['support', 5],
-  /** Spectral flatness of the neighbourhood: 0 a clean tone, 15 white noise. */
+  /**
+   * Spectral flatness, 0 a clean tone and 15 white noise. Of the whole frame rather than of
+   * anywhere in particular, and sampled every thirty-seventh bin — one number the entire
+   * generation shares, not a local measurement.
+   */
   ['flatness', 4],
-  /** Spectral flux at birth, signed and biased by 8: positive is a rising edge. */
-  ['onset', 4],
+  /**
+   * How empty the birth frequency was, signed and biased by 8: positive means nothing much was
+   * already living there. This is occupancy of the pheromone field, which is to say how many
+   * particles the frequency already holds — *not* spectral flux, and not an attack detector.
+   */
+  ['vacancy', 4],
   /** Octave band of the birth frequency, 0 = below 20 Hz, 15 = above 20 kHz. */
   ['register', 4],
-  /** How small reassignment's corrections were: 15 a stable partial, 0 phase noise. */
+  /**
+   * How small reassignment's corrections were: 15 a stable partial, 0 phase noise. Also 0 when
+   * reassignment is switched off, because then there is no measurement — unknown rather than
+   * certain, which is what it used to claim.
+   */
   ['coherence', 4],
 ] as const
 
@@ -111,11 +127,12 @@ export interface Birth {
   harmonic: number
   /** Signed cents from the exact harmonic, clamped to ±31. */
   detuneCents: number
+  /** Members of the series present in this frame; see LIFE0_FIELDS. */
   support: number
-  /** 0..1 */
+  /** 0..1, for the whole frame rather than for a neighbourhood. */
   flatness: number
-  /** Signed, roughly −1..1, in units of "doubling per frame". */
-  onset: number
+  /** Signed, roughly −1..1. Field vacancy at the birth frequency; see LIFE0_FIELDS. */
+  vacancy: number
   /** Hz. */
   frequency: number
   /** 0..1, where 1 means reassignment barely had to move the point. */
@@ -136,7 +153,7 @@ export function encodeLife0(birth: Birth): number {
     detune: Math.max(0, Math.min(63, Math.round(birth.detuneCents) + 32)),
     support: Math.min(31, Math.max(0, birth.support)),
     flatness: Math.round(Math.max(0, Math.min(1, birth.flatness)) * 15),
-    onset: Math.max(0, Math.min(15, Math.round(birth.onset * 7) + 8)),
+    vacancy: Math.max(0, Math.min(15, Math.round(birth.vacancy * 7) + 8)),
     register: registerOf(birth.frequency),
     coherence: Math.round(Math.max(0, Math.min(1, birth.coherence)) * 15),
   })
@@ -147,7 +164,7 @@ export interface Life0 {
   detuneCents: number
   support: number
   flatness: number
-  onset: number
+  vacancy: number
   register: number
   coherence: number
 }
@@ -159,7 +176,7 @@ export function decodeLife0(word: number): Life0 {
     detuneCents: raw.detune - 32,
     support: raw.support,
     flatness: raw.flatness / 15,
-    onset: (raw.onset - 8) / 7,
+    vacancy: (raw.vacancy - 8) / 7,
     register: raw.register,
     coherence: raw.coherence / 15,
   }
@@ -209,7 +226,7 @@ export const FLAG_ALIVE = 1 << 0
 /** Sits on a harmonic series rather than standing alone. */
 export const FLAG_HARMONIC = 1 << 1
 /** Born on a rising edge. */
-export const FLAG_ONSET = 1 << 2
+export const FLAG_VACANT = 1 << 2
 /** Born into a flat, noise-like neighbourhood. */
 export const FLAG_NOISE = 1 << 3
 

@@ -54,7 +54,18 @@ export interface LoudnessReading {
  * BS.1770-4 Annex 2 specifies a minimum of 4x oversampling at 48 kHz. We build a Kaiser-
  * windowed sinc with 32 taps per phase (the Recommendation's reference filter uses 12),
  * which puts the passband ripple and stopband rejection comfortably inside the tolerance.
- * Above 48 kHz the Nyquist headroom means fewer phases are needed for the same accuracy.
+ * Above 48 kHz the Nyquist headroom means half as many phases reach the same accuracy.
+ *
+ * Phase 0 is the identity, and that is not an implementation detail.
+ * -----------------------------------------------------------------------------------------
+ * Each phase reconstructs the signal at a fractional offset p/factor from the sample grid.
+ * Phase 0's offset is zero, so its sinc lands on integer taps — one at the centre and exactly
+ * zero at every other — and it hands back the original sample untouched. That is what makes
+ * the sample grid part of the candidate set, and it depends entirely on the centre tap being
+ * an *integer*. Decimating an even-length prototype, as this did, centres on a half-integer
+ * and puts all four phases at 0.125, 0.375, 0.625 and 0.875: the original samples are never
+ * examined and the meter reads *below* the sample peak, which no true-peak meter may ever do.
+ * A 0 dBFS impulse measured -0.23 dBTP at 48 kHz and -3.96 dBTP at 192 kHz before this.
  */
 class TruePeakOversampler {
   private readonly phases: Float64Array[]
@@ -62,32 +73,32 @@ class TruePeakOversampler {
   private readonly history: Float64Array
   private historyPos = 0
 
-  constructor(factor: number, tapsPerPhase = 32) {
-    this.tapsPerPhase = tapsPerPhase
+  constructor(factor: number, halfTaps = 16) {
+    // Symmetric about tap `centre`, which is a whole tap rather than the gap between two.
+    const taps = halfTaps * 2
+    this.tapsPerPhase = taps
     this.phases = []
-    const totalTaps = factor * tapsPerPhase
+    const centre = halfTaps - 1
     const beta = 9.0
-    const proto = new Float64Array(totalTaps)
-    const centre = (totalTaps - 1) / 2
-    for (let i = 0; i < totalTaps; i++) {
-      const t = (i - centre) / factor
-      const sinc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t)
-      const u = (2 * i) / (totalTaps - 1) - 1
-      const r = Math.max(0, 1 - u * u)
-      proto[i] = sinc * (besselI0(beta * Math.sqrt(r)) / besselI0(beta))
-    }
     for (let p = 0; p < factor; p++) {
-      const phase = new Float64Array(tapsPerPhase)
+      // `push` pairs phase[0] with the newest sample, so tap k reaches k samples back; the
+      // fractional part of the delay is the only thing that moves a phase off the grid.
+      const d = p / factor
+      const phase = new Float64Array(taps)
       let sum = 0
-      for (let k = 0; k < tapsPerPhase; k++) {
-        phase[k] = proto[k * factor + p]
+      for (let k = 0; k < taps; k++) {
+        const t = k - centre - d
+        const sinc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t)
+        const u = t / halfTaps
+        const r = Math.max(0, 1 - u * u)
+        phase[k] = sinc * (besselI0(beta * Math.sqrt(r)) / besselI0(beta))
         sum += phase[k]
       }
       // Unity DC gain per phase keeps a constant input from producing a peak overshoot.
-      if (sum !== 0) for (let k = 0; k < tapsPerPhase; k++) phase[k] /= sum
+      if (sum !== 0) for (let k = 0; k < taps; k++) phase[k] /= sum
       this.phases.push(phase)
     }
-    this.history = new Float64Array(tapsPerPhase)
+    this.history = new Float64Array(taps)
   }
 
   /** Returns the maximum absolute interpolated value over the block. */
@@ -171,14 +182,17 @@ export class LoudnessMeter {
     this.shelfState = Array.from({ length: channels }, () => new BiquadState())
     this.hpfState = Array.from({ length: channels }, () => new BiquadState())
 
-    const factor = sampleRate <= 48000 ? 4 : sampleRate <= 96000 ? 2 : 1
-    this.oversamplers = Array.from(
-      { length: channels },
-      () => new TruePeakOversampler(Math.max(1, factor)),
-    )
+    // 4x to 48 kHz, 2x above it: the Recommendation's accuracy requirement is stated against
+    // 48 kHz, and doubling an already-doubled rate has the same effective resolution. Never 1x —
+    // that would leave a single phase, and one phase cannot resolve anything between samples.
+    const factor = sampleRate <= 48000 ? 4 : 2
+    this.oversamplers = Array.from({ length: channels }, () => new TruePeakOversampler(factor))
 
-    this.blockSamples = Math.round(BLOCK_SECONDS * sampleRate)
-    this.stepSamples = Math.round(BLOCK_STEP_SECONDS * sampleRate)
+    this.blockSamples = Math.max(1, Math.round(BLOCK_SECONDS * sampleRate))
+    // Never zero. `process` advances by min(room in this step, frames left) and a zero-length
+    // step leaves no room, so a nonsensical rate would not merely mismeasure — it would spin
+    // forever, in a worker, with nothing on screen to say why.
+    this.stepSamples = Math.max(1, Math.round(BLOCK_STEP_SECONDS * sampleRate))
     this.stepRingLen = Math.round(SHORT_TERM_SECONDS / BLOCK_STEP_SECONDS) + 4
     this.stepSum = new Float64Array(channels)
     this.stepRing = new Float64Array(this.stepRingLen * channels)
@@ -209,20 +223,58 @@ export class LoudnessMeter {
   }
 
   /**
-   * Feed one planar block of up to `maxBlock` frames.
+   * Feed one planar block of frames.
    *
    * `planes[c]` is the channel's storage, `offsets[c]` the absolute index of the first frame,
    * and `mask` wraps that index into the storage. Callers reading a ring pass capacity - 1;
    * callers holding a standalone block pass offset 0 and length - 1, which requires the block
-   * length to be a power of two.
+   * length to be a power of two. Any length is accepted: the block is cut into scratch-sized
+   * pieces internally rather than truncated.
+   *
+   * The block is also cut at every 100 ms gating boundary *before* any of it is accumulated,
+   * and that is the whole reason this is a loop rather than one pass. A step's mean square is
+   * its running sum divided by exactly `stepSamples`; energy credited across a boundary
+   * therefore inflates the step it lands in and starves the one after it. Since the boundaries
+   * would fall wherever the caller happened to cut the stream, the reading would be a property
+   * of the buffer size rather than of the signal. It is not: the same audio fed in 128, 4800
+   * or 8192-frame blocks gives identical readings.
    */
   process(planes: Float32Array[], offsets: number[], count: number, mask: number): void {
-    const n = Math.min(count, this.scratchIn.length)
-    if (n <= 0) return
+    let done = 0
+    while (done < count) {
+      const take = Math.min(
+        this.stepSamples - this.stepCount,
+        count - done,
+        this.scratchIn.length,
+      )
+      this.ingest(planes, offsets, done, take, mask)
+      this.stepCount += take
+      this.totalSamples += take
+      done += take
+      if (this.stepCount >= this.stepSamples) {
+        this.commitStep()
+        this.stepCount = 0
+      }
+    }
+  }
 
+  /**
+   * One span of frames lying entirely within the current gating step.
+   *
+   * Every piece of state here is continuous across the cut — the biquads keep their history,
+   * the oversampler keeps its delay line, the correlation keeps its exponential memory — so
+   * splitting a block changes nothing about what any of them see.
+   */
+  private ingest(
+    planes: Float32Array[],
+    offsets: number[],
+    from: number,
+    n: number,
+    mask: number,
+  ): void {
     for (let c = 0; c < this.channels; c++) {
       const src = planes[Math.min(c, planes.length - 1)]
-      const base = offsets[Math.min(c, offsets.length - 1)]
+      const base = offsets[Math.min(c, offsets.length - 1)] + from
       for (let i = 0; i < n; i++) this.scratchIn[i] = src[(base + i) & mask]
 
       // Sample peak and true peak on the *unweighted* signal, per the Recommendation.
@@ -245,17 +297,15 @@ export class LoudnessMeter {
     if (this.channels >= 2 && planes.length >= 2) {
       const l = planes[0]
       const r = planes[1]
-      const lo = offsets[0]
-      const ro = offsets[Math.min(1, offsets.length - 1)]
-      const lm = mask
-      const rm = mask
+      const lo = offsets[0] + from
+      const ro = offsets[Math.min(1, offsets.length - 1)] + from
       let lr = this.corrLR
       let ll = this.corrLL
       let rr = this.corrRR
       const d = this.corrDecay
       for (let i = 0; i < n; i++) {
-        const a = l[(lo + i) & lm]
-        const b = r[(ro + i) & rm]
+        const a = l[(lo + i) & mask]
+        const b = r[(ro + i) & mask]
         lr = lr * d + a * b
         ll = ll * d + a * a
         rr = rr * d + b * b
@@ -263,13 +313,6 @@ export class LoudnessMeter {
       this.corrLR = lr
       this.corrLL = ll
       this.corrRR = rr
-    }
-
-    this.totalSamples += n
-    this.stepCount += n
-    while (this.stepCount >= this.stepSamples) {
-      this.commitStep()
-      this.stepCount -= this.stepSamples
     }
   }
 
@@ -331,12 +374,18 @@ export class LoudnessMeter {
     const denom = Math.sqrt(this.corrLL * this.corrRR)
     const correlation = denom > 1e-20 ? this.corrLR / denom : 0
 
+    // The interpolator's phase 0 is the identity, so this max is already satisfied by
+    // construction. Stating it anyway makes the invariant a property of the class rather than
+    // of the filter design: true peak is the peak of the reconstructed waveform, and the
+    // sampled waveform is part of it. No rebuild of the taps can quietly break it again.
+    const peak = Math.max(this.truePeak, this.samplePeak)
+
     return {
       momentary,
       shortTerm,
       integrated: this.gatedIntegrated(),
       range: this.loudnessRange(),
-      truePeakDb: this.truePeak > 0 ? 20 * Math.log10(this.truePeak) : -Infinity,
+      truePeakDb: peak > 0 ? 20 * Math.log10(peak) : -Infinity,
       samplePeakDb: this.samplePeak > 0 ? 20 * Math.log10(this.samplePeak) : -Infinity,
       correlation: Math.max(-1, Math.min(1, correlation)),
       seconds: this.totalSamples / this.sampleRate,

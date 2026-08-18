@@ -37,9 +37,12 @@ import sgPresentWgsl from './shaders/spectrogram_present.wgsl?raw'
 import lifeDrawWgsl from './shaders/life_draw.wgsl?raw'
 import postWgsl from './shaders/post.wgsl?raw'
 
-const SCENE_FORMAT: GPUTextureFormat = 'rgba16float'
+import { BLOOM_DIVISOR, SCENE_BYTES_PER_TEXEL, SCENE_FORMAT } from './limits.ts'
+
+export { BLOOM_DIVISOR, SCENE_BYTES_PER_TEXEL, SCENE_FORMAT }
+
 const MAX_GRID_LINES = 512
-const BLOOM_DIVISOR = 4
+
 /** Uniform buffer slot stride; must be a multiple of minUniformBufferOffsetAlignment. */
 const POST_SLOT = 256
 /** Style is written once per pane, into its own slot of one buffer. */
@@ -68,6 +71,32 @@ const ADDITIVE: GPUBlendState = {
 const LIFE_BLEND_MODES = ['add', 'screen', 'lighten'] as const
 
 /** Builds one of a thing per blend mode. */
+/**
+ * The history texture's dimensions for a given configuration and pane height.
+ *
+ * Exported because the budget has to size this allocation before the renderer makes it, and two
+ * copies of the arithmetic would be two chances to disagree about a quarter of a gigabyte.
+ */
+export function historySize(
+  config: Config,
+  sampleRate: number,
+  hop: number,
+  height: number,
+): { columns: number; rows: number } {
+  return {
+    columns: Math.max(
+      64,
+      Math.min(8192, Math.ceil((config.spectrogram.historySeconds * sampleRate) / hop) + 8),
+    ),
+    rows: Math.max(512, Math.min(4096, 1 << Math.ceil(Math.log2(Math.max(height, 512))))),
+  }
+}
+
+/** Whether the organism actually has a population this frame. */
+function living(frame: RenderFrame): boolean {
+  return (frame.particleCount ?? 0) > 0
+}
+
 function byBlend<T>(make: (blend: LifeBlend) => T): Record<LifeBlend, T> {
   return Object.fromEntries(LIFE_BLEND_MODES.map((b) => [b, make(b)])) as Record<LifeBlend, T>
 }
@@ -104,8 +133,18 @@ export interface RenderPane {
 export interface RenderFrame {
   config: Config
   stats: FrameStats
-  /** The living particle pool, when the organism is running. */
-  particles?: GPUBuffer
+  /**
+   * The particle pool. Always the same buffer, whether or not anything in it is alive —
+   * `particleCount` is what says whether the organism ran this frame.
+   *
+   * It was optional, and the omission was load-bearing in the wrong direction: the spectrogram
+   * bind group is built once and cached forever, so whichever buffer happened to be here on the
+   * first painted frame was the one every later frame read. Starting with the organism off
+   * bound the *points* buffer into the particle slot, and switching it on afterwards left the
+   * life pass reading 16-byte reassigned points as 32-byte particles. A buffer that never
+   * changes cannot be cached wrongly.
+   */
+  particles: GPUBuffer
   particleCount?: number
   /** The birth counter, so the newest particles can be found without a readback. */
   lifeAllocator?: GPUBuffer
@@ -115,6 +154,12 @@ export interface RenderFrame {
   height: number
   nyquist: number
   channelCount: number
+  /**
+   * Ceiling on the history's width, from the GPU budget. At the top of every range the history
+   * alone is a quarter of a gigabyte, and nothing else that allocates knows about it — so the
+   * one place that adds them all up is the one place allowed to say how wide it may be.
+   */
+  maxHistoryColumns: number
 }
 
 export class Renderer {
@@ -138,6 +183,19 @@ export class Renderer {
   private historyHead = 0
   private clearedThrough = 0
   private historyKey = ''
+  /**
+   * What is *in* the history, as opposed to how big it is.
+   *
+   * A history texel is an accumulated energy at a position, and the position bakes in the
+   * frequency mapping it was written under. Nothing in a texel records which mapping that was,
+   * so moving the axis, switching it between linear and log, or handing the texture over to the
+   * organism (whose columns hold particle colour rather than spectrum energy) leaves the old
+   * columns and the new ones in different coordinate systems, shown side by side as though they
+   * agreed. The size key cannot cover this: the axis limits are sliders, and reallocating a
+   * quarter of a gigabyte on every frame of a drag is not a fix. Clearing is.
+   */
+  private historyContentKey = ''
+  private historyDirty = false
 
   private readonly styleBuf: GPUBuffer
   private readonly gridBuf: GPUBuffer
@@ -434,6 +492,7 @@ export class Renderer {
     this.waveBinds = []
     this.vectorBind = null
     this.lifeDrawBinds = {}
+    this.splatBind = null
     this.historyHead = 0
     this.clearedThrough = 0
     // Force the history texture to be recreated so the previous source's spectrogram does not
@@ -507,28 +566,43 @@ export class Renderer {
   }
 
   /** The spectrogram history is sized in analysis columns, so it is rebuilt on hop/length changes. */
-  private ensureHistory(config: Config, sampleRate: number, hop: number, height: number): void {
-    const columns = Math.max(
-      64,
-      Math.min(8192, Math.ceil((config.spectrogram.historySeconds * sampleRate) / hop) + 8),
-    )
-    const rows = Math.max(512, Math.min(4096, 1 << Math.ceil(Math.log2(Math.max(height, 512)))))
+  private ensureHistory(
+    config: Config,
+    sampleRate: number,
+    hop: number,
+    height: number,
+    living: boolean,
+    maxColumns: number,
+  ): void {
+    const size = historySize(config, sampleRate, hop, height)
+    const columns = Math.max(64, Math.min(size.columns, Math.floor(maxColumns) || size.columns))
+    const rows = size.rows
     const key = `${columns}x${rows}`
-    if (this.historyKey === key && this.history) return
+    if (this.historyKey !== key || !this.history) {
+      this.history?.destroy()
+      this.history = this.device.createTexture({
+        label: 'spectrogram-history',
+        size: [columns, rows],
+        format: SCENE_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.historyColumns = columns
+      this.historyRows = rows
+      this.historyKey = key
+      this.historyHead = 0
+      this.clearedThrough = 0
+      this.sgPresentBind = null
+      this.splatBind = null
+    }
 
-    this.history?.destroy()
-    this.history = this.device.createTexture({
-      label: 'spectrogram-history',
-      size: [columns, rows],
-      format: SCENE_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.historyColumns = columns
-    this.historyRows = rows
-    this.historyKey = key
-    this.historyHead = 0
-    this.clearedThrough = 0
-    this.sgPresentBind = null
+    const sg = config.spectrogram
+    const content = `${sg.freqMin}|${sg.freqMax}|${sg.logFrequency}|${living}`
+    if (this.historyContentKey !== content) {
+      this.historyContentKey = content
+      this.historyDirty = true
+      this.historyHead = 0
+      this.clearedThrough = 0
+    }
   }
 
   private ensurePalette(id: string): void {
@@ -591,7 +665,7 @@ export class Renderer {
     // pane honours the same knob a layer down instead, by scaling what the measurement deposits
     // into the history — see `fsSplatBase`.
     const fadeBase =
-      frame.config.life.enabled && frame.particles && mode !== 'spectrogram'
+      frame.config.life.enabled && living(frame) && mode !== 'spectrogram'
         ? frame.config.life.baseOpacity
         : 1
     f[21] = s.intensity * fadeBase
@@ -684,7 +758,15 @@ export class Renderer {
 
     const spectrogram = frame.panes.find((p) => p.mode === 'spectrogram')
     if (spectrogram) {
-      this.ensureHistory(cfg, frame.stats.sampleRate, cfg.analysis.hop, spectrogram.rect.height)
+      this.ensureHistory(
+        cfg,
+        frame.stats.sampleRate,
+        cfg.analysis.hop,
+        spectrogram.rect.height,
+        living(frame) && cfg.life.enabled,
+        frame.maxHistoryColumns,
+      )
+      this.clearHistoryIfDirty(encoder)
       this.recordSpectrogramHistory(encoder, frame)
     }
 
@@ -732,7 +814,7 @@ export class Renderer {
       }
       // The population, drawn over whatever the scope was already showing. The spectrogram is
       // excluded because there the particles *are* the picture rather than a layer on it.
-      if (frame.particles && cfg.life.enabled && pane.mode !== 'spectrogram') {
+      if (living(frame) && cfg.life.enabled && pane.mode !== 'spectrogram') {
         this.drawLifeLayer(scenePass, frame, pane)
       }
     })
@@ -944,7 +1026,7 @@ export class Renderer {
         layout: this.lifeDrawLayout,
         entries: [
           { binding: 0, resource: this.styleBinding(pane.slot) },
-          { binding: 1, resource: { buffer: frame.particles! } },
+          { binding: 1, resource: { buffer: frame.particles } },
           { binding: 2, resource: { buffer: this.lifeDrawParams[kind] } },
           { binding: 3, resource: { buffer: frame.lifeAllocator! } },
         ],
@@ -982,18 +1064,41 @@ export class Renderer {
    */
   private presentMargin(frame: RenderFrame): number {
     const margin = this.spectrogramMargin(frame.config)
-    if (!frame.particles || !frame.config.life.enabled) return margin
+    if (!living(frame) || !frame.config.life.enabled) return margin
     const lead = Math.max(0, Math.min(1, frame.config.life.lead))
     return Math.max(0, Math.round(margin * (1 - lead)))
   }
 
+  /**
+   * Wipe the whole ring in one pass. Separate from `recordSpectrogramHistory` because that one
+   * returns early on a frame with no new analysis, and a stale picture would then be presented
+   * under a new axis for as long as the signal stayed quiet.
+   */
+  private clearHistoryIfDirty(encoder: GPUCommandEncoder): void {
+    if (!this.historyDirty || !this.history) return
+    this.historyDirty = false
+    encoder
+      .beginRenderPass({
+        label: 'spectrogram-history-reset',
+        colorAttachments: [
+          {
+            view: this.history.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          },
+        ],
+      })
+      .end()
+  }
+
   private recordSpectrogramHistory(encoder: GPUCommandEncoder, frame: RenderFrame): void {
     const history = this.history
-    const living = Boolean(frame.particles && frame.config.life.enabled)
+    const alive = living(frame) && frame.config.life.enabled
     // A living population keeps painting through silence — that is the point of it — so the
     // history advances whenever analysis frames arrived, not only when they carried points.
     if (!history || frame.stats.frames === 0) return
-    if (!living && frame.stats.pointCount === 0) return
+    if (!alive && frame.stats.pointCount === 0) return
     const cfg = frame.config
     const cols = this.historyColumns
     const margin = this.spectrogramMargin(cfg)
@@ -1020,7 +1125,11 @@ export class Renderer {
     f[6] = Math.min(cfg.spectrogram.freqMax, frame.nyquist)
     f[7] = cfg.spectrogram.logFrequency ? 1 : 0
     f[8] = cfg.spectrogram.splatRadius
-    f[9] = cfg.spectrogram.gain
+    // Gain is a display control and lives only in the present pass. It used to be applied here
+    // as well, which meant it was baked into every column at the moment it was written: moving
+    // the knob left a permanent step in the picture where the old columns met the new ones, and
+    // multiplied twice over on everything after it.
+    f[9] = 0
     f[10] = startCol
     f[11] = firstRun
     f[12] = 0
@@ -1050,7 +1159,7 @@ export class Renderer {
         entries: [
           { binding: 0, resource: { buffer: this.splatParams } },
           { binding: 1, resource: { buffer: this.analyzer.pointsBuf } },
-          { binding: 2, resource: { buffer: frame.particles ?? this.analyzer.pointsBuf } },
+          { binding: 2, resource: { buffer: frame.particles } },
         ],
       })
     }
@@ -1064,7 +1173,7 @@ export class Renderer {
       pass.setBindGroup(0, this.splatBind)
       pass.draw(6, 2)
     }
-    if (frame.particles && cfg.life.enabled) {
+    if (alive) {
       // Both, and the knob between them. The measurement goes down first as a monochrome ground
       // — where the energy actually is — and the population goes over it in its own colours,
       // wherever it has migrated to. Seeing the two at once is the only way to tell that a
@@ -1112,7 +1221,7 @@ export class Renderer {
     f[6] = cfg.spectrogram.dbCeil
     f[7] = cfg.spectrogram.gain
     f[8] = cfg.spectrogram.normalise ? 1 : 0
-    f[9] = frame.particles && cfg.life.enabled ? 1 : 0
+    f[9] = living(frame) && cfg.life.enabled ? 1 : 0
     f[10] = cfg.life.saturation
     f[11] = 0
     this.device.queue.writeBuffer(this.sgPresentParams, 0, this.scratch, 0, 48)

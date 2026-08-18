@@ -1,11 +1,25 @@
 // Goniometer / vectorscope.
 //
 // The studio convention rotates the L/R plane 45 degrees so the axes become mid and side:
-// vertical is (L+R)/sqrt(2), horizontal is (L-R)/sqrt(2). A mono source therefore draws a
-// vertical line, a wide source spreads horizontally, and a polarity-inverted channel collapses
-// to a horizontal line — the three things an engineer is actually looking for. Turning the
-// rotation off plots the channels raw, X against Y, which is the Lissajous figure an
-// oscilloscope in X-Y mode draws and the form the classic patterns are quoted in.
+// vertical is (L+R)/2, horizontal is (L-R)/2. A mono source therefore draws a vertical line, a
+// wide source spreads horizontally, and a polarity-inverted channel collapses to a horizontal
+// line — the three things an engineer is actually looking for. Turning the rotation off plots
+// the channels raw, X against Y, which is the Lissajous figure an oscilloscope in X-Y mode
+// draws and the form the classic patterns are quoted in.
+//
+// Halved rather than divided by sqrt(2), and the difference is what the graticule means.
+// ---------------------------------------------------------------------------------------
+// The energy-preserving rotation divides by sqrt(2), which sends a full-scale correlated signal
+// to sqrt(2) — off the top of a pane whose outer reference is 1, and twice the +/-0.707 line the
+// graticule and the config comment both described as where it lands. Halving instead puts the
+// three readings an engineer looks for exactly on the rulings, in both modes at once:
+//
+//   full-scale mono          (0, 1)        the outer ring, top
+//   full-scale out of phase  (1, 0)        the outer ring, side
+//   one channel at full scale (0.5, 0.5)   the inner rulings
+//
+// The whole figure now lives inside its own graticule, and mid/side and Lissajous read on the
+// same scale so switching between them does not resize the picture. See ui/axes.ts.
 //
 // Samples are drawn with alpha rising towards the newest, which gives the phosphor-decay look a
 // hardware goniometer has and makes the direction of travel legible. Joined up they are a trace;
@@ -43,8 +57,7 @@ fn samplePoint(index: u32) -> vec2<f32> {
   if (V.b.z > 0.5) {
     return vec2<f32>(l, r);
   }
-  let inv = 0.70710678;
-  return vec2<f32>((l - r) * inv, (l + r) * inv);
+  return vec2<f32>((l - r) * 0.5, (l + r) * 0.5);
 }
 
 fn toScreen(p: vec2<f32>) -> vec2<f32> {

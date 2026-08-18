@@ -5,7 +5,14 @@ import { AudioEngine, type EngineStatus } from './audio/engine.ts'
 import { AudioRing, type RingReader } from './audio/ring.ts'
 import { initGpu, WebGpuUnavailableError, type GpuContext } from './gpu/device.ts'
 import { Analyzer } from './gpu/analyzer.ts'
-import { Renderer } from './gpu/renderer.ts'
+import { Renderer, historySize } from './gpu/renderer.ts'
+import {
+  budgetCeiling as computeBudgetCeiling,
+  estimateBudget,
+  fitToBudget,
+  type BudgetCaps,
+  type BudgetReport,
+} from './gpu/budget.ts'
 import { Life } from './gpu/life.ts'
 import { buildGraticule } from './ui/axes.ts'
 import { computeLayoutPair } from './ui/layout.ts'
@@ -244,6 +251,7 @@ async function main(): Promise<void> {
   engine.onSourceEnded = () => {
     analyzer.attach(null)
     renderer.invalidate()
+    life.reset()
     attachMeters(null)
     overlay.notify(engine.status.message || 'Capture device disconnected')
     void engine.listInputs().then((devices) => overlay.setDevices(devices))
@@ -289,6 +297,26 @@ async function main(): Promise<void> {
   // ------------------------------------------------------------------ overlay
   let fps = 60
   let analysisFps = 0
+  const budgetCeiling = computeBudgetCeiling(device.limits)
+  let lastBudgetCaps: BudgetCaps = { historyColumns: 8192, population: Infinity, reduced: [] }
+  // Seeded through the real estimator rather than with an empty list, so the panel has its rows
+  // from the first build instead of only after the first painted frame.
+  let lastBudget: BudgetReport = estimateBudget(
+    {
+      width: 0,
+      height: 0,
+      sampleCount: 1,
+      historyColumns: 0,
+      historyRows: 0,
+      spectrogram: false,
+      channels: 2,
+      population: 0,
+      trail: 0,
+      lifeEnabled: false,
+      livePanes: 0,
+    },
+    budgetCeiling,
+  )
   let lastStats = {
     frames: 0,
     dropped: 0,
@@ -316,6 +344,8 @@ async function main(): Promise<void> {
       binHz: (engineStatus.sampleRate || 48000) / config.analysis.fftSize,
       enbwHz: (tables.nenbw * (engineStatus.sampleRate || 48000)) / config.analysis.fftSize,
       latencyMs: (engineStatus.baseLatencySec + engineStatus.outputLatencySec) * 1000,
+      budget: lastBudget,
+      budgetReduced: lastBudgetCaps.reduced,
     }
   }
 
@@ -550,6 +580,33 @@ async function main(): Promise<void> {
     // GPU replaces it with an exact number of detected periods.
     const spanSamples = (config.wave.timebaseMs / 1000) * sampleRate
 
+    // Everything that allocates, added up in one place before any of it is asked for. Each of
+    // these was bounded on its own and never against the others, which is how four individually
+    // reasonable settings become a configuration that is not. See gpu/budget.ts.
+    const spectrogramPane = panes.find((p) => p.visible && p.css.mode === 'spectrogram')
+    const history = spectrogramPane
+      ? historySize(config, sampleRate, config.analysis.hop, spectrogramPane.device.height)
+      : { columns: 0, rows: 0 }
+    const budgetInputs = {
+      width: pixelWidth,
+      height: pixelHeight,
+      sampleCount: config.perf.msaa ? 4 : 1,
+      historyColumns: history.columns,
+      historyRows: history.rows,
+      spectrogram: Boolean(spectrogramPane),
+      channels: analyzer.ringChannels || count,
+      population: config.life.population,
+      trail: config.life.trail,
+      lifeEnabled: config.life.enabled,
+      livePanes: living ? panes.filter((p) => p.visible).length : 0,
+    }
+    const caps = fitToBudget(budgetInputs, budgetCeiling)
+    lastBudget = estimateBudget(
+      { ...budgetInputs, historyColumns: caps.historyColumns, population: caps.population },
+      budgetCeiling,
+    )
+    lastBudgetCaps = caps
+
     const encoder = device.createCommandEncoder({ label: 'frame' })
     const stats = analyzer.record(encoder, {
       settings: {
@@ -595,7 +652,11 @@ async function main(): Promise<void> {
     if (living) {
       particleCount = life.record(encoder, {
         config,
+        maxPopulation: caps.population,
         pointCount: stats.pointCount,
+        // The organism's clock is the audio's, so what it needs is how much audio went past —
+        // not how long the paint took, and not how many frames the transform happened to batch.
+        elapsedSamples: stats.frames * Math.max(1, config.analysis.hop),
         sampleRate,
         spectrumBins: config.analysis.fftSize / 2 + 1,
         viewLowHz: config.spectrogram.freqMin,
@@ -633,7 +694,7 @@ async function main(): Promise<void> {
     renderer.render(encoder, {
       config,
       stats,
-      particles: particleCount > 0 ? life.particles : undefined,
+      particles: life.particles,
       particleCount,
       lifeAllocator: life.allocator,
       panes: graticules.map(({ pane, seconds, graticule }) => ({
@@ -647,6 +708,7 @@ async function main(): Promise<void> {
       height: pixelHeight,
       nyquist,
       channelCount: count,
+      maxHistoryColumns: caps.historyColumns || history.columns,
     })
     device.queue.submit([encoder.finish()])
 

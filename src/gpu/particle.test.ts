@@ -31,7 +31,7 @@ const birth = (over: Partial<Birth> = {}): Birth => ({
   detuneCents: -7,
   support: 6,
   flatness: 0.2,
-  onset: 0.5,
+  vacancy: 0.5,
   frequency: 660,
   coherence: 0.8,
   cohort: 11,
@@ -61,26 +61,26 @@ test('birth attributes survive a round trip within their quantisation', () => {
   assert.equal(out.detuneCents, b.detuneCents)
   assert.equal(out.support, b.support)
   assert.ok(Math.abs(out.flatness - b.flatness) <= 1 / 15)
-  assert.ok(Math.abs(out.onset - b.onset) <= 1 / 7)
+  assert.ok(Math.abs(out.vacancy - b.vacancy) <= 1 / 7)
   assert.ok(Math.abs(out.coherence - b.coherence) <= 1 / 15)
   assert.equal(out.register, registerOf(b.frequency))
 })
 
 test('every field saturates instead of wrapping into its neighbour', () => {
   const extreme = encodeLife0(
-    birth({ harmonic: 999, detuneCents: 5000, support: 999, flatness: 12, onset: 40, coherence: 9 }),
+    birth({ harmonic: 999, detuneCents: 5000, support: 999, flatness: 12, vacancy: 40, coherence: 9 }),
   )
   const out = decodeLife0(extreme)
   assert.equal(out.harmonic, 31)
   assert.equal(out.detuneCents, 31)
   assert.equal(out.support, 31)
   assert.equal(out.flatness, 1)
-  assert.equal(out.onset, 1)
+  assert.equal(out.vacancy, 1)
   assert.equal(out.coherence, 1)
 
-  const negative = decodeLife0(encodeLife0(birth({ detuneCents: -5000, onset: -40 })))
+  const negative = decodeLife0(encodeLife0(birth({ detuneCents: -5000, vacancy: -40 })))
   assert.equal(negative.detuneCents, -32)
-  assert.equal(negative.onset, -8 / 7)
+  assert.equal(negative.vacancy, -8 / 7)
 })
 
 test('running state round trips, and age reaches far past the visible history', () => {

@@ -61,7 +61,7 @@ export const WINDOWS: readonly WindowSpec[] = [
     rolloffDbPerOctave: -6,
     nenbw: 1.0,
     optimalOverlapPct: 0,
-    note: 'No leakage suppression. Only correct for exactly periodic signals or transient capture.',
+    note: 'No leakage suppression. Only correct for exactly periodic signals or transient capture. Frequency reassignment is unavailable: a window that does not taper has no derivative for it to read.',
   },
   {
     id: 'hann',
@@ -81,7 +81,7 @@ export const WINDOWS: readonly WindowSpec[] = [
     rolloffDbPerOctave: -6,
     nenbw: 1.3628,
     optimalOverlapPct: 60.96,
-    note: 'Lower first sidelobe than Hann but the tail only falls 6 dB/octave.',
+    note: 'Lower first sidelobe than Hann but the tail only falls 6 dB/octave. Its endpoints stand at 0.08, so frequency reassignment carries a measurable endpoint bias.',
   },
   {
     id: 'blackman',
@@ -158,7 +158,7 @@ export const WINDOWS: readonly WindowSpec[] = [
     paramDefault: 12,
     paramMin: 0,
     paramMax: 30,
-    note: 'Continuously tunable leakage/resolution trade-off. beta ~= 12 approximates Blackman-Harris.',
+    note: 'Continuously tunable leakage/resolution trade-off. beta ~= 12 approximates Blackman-Harris; beta = 0 is rectangular, and below about 1.3 the window no longer tapers enough for frequency reassignment.',
   },
   {
     id: 'gaussian',
@@ -211,14 +211,48 @@ export function windowValue(id: WindowId, n: number, size: number, param: number
   }
   if (id === 'kaiser') {
     // Argument runs over [-1, 1] across the window.
+    //
+    // The endpoint is clamped, not zeroed. A Kaiser is I0(beta*sqrt(1-u^2))/I0(beta), which at
+    // u = +/-1 is 1/I0(beta) — small for a large beta, and exactly *one* at beta = 0, where the
+    // window is by definition rectangular. Returning zero there put a hole in the first sample
+    // of every Kaiser: at beta = 0 it made a rectangular window with a notch in it, and at any
+    // beta it handed the central difference a step from 0 to w(h) that came out as a derivative
+    // fourteen thousand times its own neighbour — an impulse in the derivative table, straight
+    // into the frequency reassignment that reads it.
     const u = (2 * n) / size - 1
-    const r = 1 - u * u
-    if (r <= 0) return 0
+    const r = Math.max(0, 1 - u * u)
     return besselI0(param * Math.sqrt(r)) / besselI0(param)
   }
   // Gaussian: param is sigma expressed as a fraction of the half-width.
   const u = (2 * n) / size - 1
   return Math.exp(-0.5 * (u / param) * (u / param))
+}
+
+/**
+ * Above this ratio of endpoint to peak, the derivative table is not a derivative.
+ * ---------------------------------------------------------------------------------------
+ * Frequency reassignment reads dw/dn, and the derivation behind it assumes the window has
+ * compact support — that it goes to zero at both ends. A window that does not, does not have
+ * the derivative this table holds: the true one carries a delta at each boundary, which the
+ * central difference over the periodic continuation cannot see and does not contain.
+ *
+ * Rectangular is the limit case and shows what the omission costs. Its interior derivative is
+ * identically zero, so X_dw is zero, so the frequency correction is zero — reassignment is
+ * switched off and says nothing about it. That is worth refusing rather than pretending.
+ */
+export const REASSIGN_ENDPOINT_LIMIT = 0.5
+/** Above this it still works, but the endpoint bias is measurable. Hamming sits at 0.08. */
+export const REASSIGN_ENDPOINT_WARN = 0.01
+
+/** |w(0)| as a fraction of the window's peak. Every window here peaks at its centre. */
+export function windowEndpointRatio(id: WindowId, size: number, param: number): number {
+  const peak = Math.abs(windowValue(id, size / 2, size, param))
+  return peak > 0 ? Math.abs(windowValue(id, 0, size, param)) / peak : 1
+}
+
+/** Whether frequency reassignment can be trusted with this window at all. */
+export function windowSupportsReassignment(id: WindowId, size: number, param: number): boolean {
+  return windowEndpointRatio(id, size, param) <= REASSIGN_ENDPOINT_LIMIT
 }
 
 export interface WindowTables {
@@ -238,6 +272,8 @@ export interface WindowTables {
   amplitudeScale: number
   /** Power-spectral-density correction (per Hz), excluding the 1/fs term. */
   densityScale: number
+  /** |w(0)| / max|w|. See REASSIGN_ENDPOINT_LIMIT. */
+  endpointRatio: number
 }
 
 /**
@@ -257,6 +293,7 @@ export function buildWindowTables(id: WindowId, size: number, param: number): Wi
 
   let s1 = 0
   let s2 = 0
+  let peak = 0
   for (let n = 0; n < size; n++) {
     const v = windowValue(id, n, size, param)
     w[n] = v
@@ -265,6 +302,7 @@ export function buildWindowTables(id: WindowId, size: number, param: number): Wi
       (windowValue(id, n + h, size, param) - windowValue(id, n - h, size, param)) / (2 * h)
     s1 += v
     s2 += v * v
+    if (Math.abs(v) > peak) peak = Math.abs(v)
   }
 
   const nenbw = (size * s2) / (s1 * s1)
@@ -277,6 +315,7 @@ export function buildWindowTables(id: WindowId, size: number, param: number): Wi
     nenbw,
     amplitudeScale: 2 / s1,
     densityScale: 2 / s2,
+    endpointRatio: peak > 0 ? Math.abs(w[0]) / peak : 1,
   }
 }
 

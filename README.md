@@ -34,7 +34,7 @@ Four visualisations, one capture and transform core, all on screen at once:
 | **Waveform** | Pitch-locked oscilloscope. GPU min/max/RMS envelope when zoomed out, band-limited sinc reconstruction when zoomed in. |
 | **Spectrum** | FFT magnitude with per-pixel bin reduction, peak hold, Welch averaging, eleven windows. Frequency axis or keyboard axis, in fifteen tunings. |
 | **Spectrogram** | Scrolling waterfall with time-frequency reassignment. |
-| **Vectorscope** | Mid/side goniometer or raw Lissajous, as a trace or a sample cloud, with phase correlation. |
+| **Vectorscope** | Mid/side goniometer or raw Lissajous, as a trace or a sample cloud, with broadband correlation. |
 
 `1`–`4` switch a visualisation on and off, and the grid collapses around whatever is left by
 one rule applied twice: **a row with no panes takes no height, and a row with one pane gives it
@@ -180,11 +180,11 @@ knowing about its own harmonic situation:
 | --- | --- |
 | **harmonic** | which harmonic of the inferred fundamental it is, or 0 for none |
 | **detune** | signed cents from the exact multiple |
-| **support** | how many other partials share its series — its family |
-| **flatness** | how noise-like the spectrum was where it appeared |
-| **onset** | whether it arrived on a rising edge or continued something already sounding |
+| **support** | how much of its series was present in that frame — a property of the series, so every particle born from the same fundamental shares the number, and a partial with no siblings still counts itself |
+| **flatness** | how noise-like *the whole frame* was, sampled every thirty-seventh bin. One number the entire generation shares, not a local measurement |
+| **vacancy** | how empty the frequency it was born on already was — pheromone field occupancy, inverted. Not spectral flux, and not an attack detector |
 | **register** | which octave it lives in |
-| **coherence** | how far reassignment had to move it, which is the best available measure of how real it is |
+| **coherence** | how far reassignment had to move it, which is the best available measure of how real it is. Zero — unknown — when reassignment is switched off |
 | **age · vitality** | how long it has lived and how much of its birth energy is left. Age is sixteen bits: a particle should be able to outlive the window it is drawn in |
 | **cohort · generation** | which note it belongs to, and how many times new energy has renewed it |
 
@@ -232,11 +232,31 @@ has, so a partial with siblings holds station while a lone one has no reason to 
 tension never settles. A partial becomes a band that keeps rearranging itself rather than a
 thousand organisms stacked in single file pretending to be a spectrogram.
 
-Four compute passes per frame — `survey`, `birth`, `step`, `settle` — in `gpu/life.ts` and
-`gpu/shaders/life.wgsl`. The bit layout lives in `gpu/particle.ts` and is duplicated by hand in
-the shader; `particle.test.ts` pins the TypeScript side, because a packing that disagreed
-between the two would not crash, it would produce particles that behave plausibly and mean
-nothing.
+Four compute passes — `survey`, `birth`, `step`, `settle` — in `gpu/life.ts` and
+`gpu/shaders/life.wgsl`. The first two run once per paint; the last two run once per tick of a
+fixed clock counted in **audio** rather than in painted frames, so the same signal grows the
+same organism on a 60 Hz display, a 144 Hz display and a throttled background tab. The bit
+layout lives in `gpu/particle.ts` and is duplicated by hand in the shader; `particle.test.ts`
+pins the TypeScript side, because a packing that disagreed between the two would not crash, it
+would produce particles that behave plausibly and mean nothing.
+
+### What it is not
+
+Harmonic life is seeded by measurement and is not itself one. Four things are worth knowing
+before reading anything off it:
+
+- **A trail is not a partial's trajectory.** A particle is born at a measured frequency and then
+  moves under forces — the surface, the crowd, the intervals, its own itinerary. Where it is now
+  is its own doing.
+- **Its identity is fixed at birth, from the newest frame of that paint's batch.** A batch spans
+  every analysis frame that arrived since the last paint, so a point measured at the start of a
+  filter sweep is named by the fundamental at the end of it.
+- **Only the first thirty-one harmonics are named.** For an A1 fundamental that stops at about
+  1.7 kHz; everything above it is harmonic 0, "fits no series".
+- **`support` and `flatness` are frame-wide, and `vacancy` is crowding.** See the table above.
+
+For measurement, read the spectrogram and the spectrum. Those are the instrument; this is what
+grows on it.
 
 ---
 
@@ -389,6 +409,19 @@ horizontal divisions are squared up against the aspect ratio instead, which is w
 gain be read off the picture: turn it up and the figure grows past its own reference, exactly as
 it does on a scope whose graticule is painted on the glass.
 
+Both modes are scaled so that a full-scale signal lands on the ±1 division and one channel at
+full scale lands on ±0.5, which means mid/side is `(L±R)/2` rather than the energy-preserving
+`(L±R)/√2`. The energy-preserving form is the right one for summing power and the wrong one for
+a picture with a graticule on it: it sends a full-scale mono signal to √2, off the top of the
+pane and past every ruling drawn for it.
+
+**The correlation meter is broadband and zero-lag.** It is a normalised dot product of the two
+channels over a ~300 ms exponential window: +1 identical, −1 inverted, 0 uncorrelated. It is not
+a phase measurement. It says nothing about phase per harmonic, filter phase rotation, group
+delay or input/output coherence — measuring any of those needs a coherent reference channel and
+a complex transfer estimate `H(f) = Y(f)/X(f)`, which this analyser does not have. The
+reassignment pass uses the phase derivatives and discards absolute phase.
+
 **A readout that resizes itself is a readout that slides under the eye.** Every field in the bar
 along the bottom carries the width of the widest reading it can produce and holds it whatever it
 is currently showing, because the numbers that move most are exactly the ones being watched —
@@ -412,7 +445,15 @@ phosphor screen — and there is headroom above 1.0 for the tone mapper to work 
 **Metering is standards-compliant at every rate.** BS.1770-4 tabulates K-weighting coefficients
 only for 48 kHz. These are re-derived from the analog prototype at the working rate, so the
 measurement stays correct at 96 and 192 kHz. True peak uses a 4× polyphase oversampler with 32
-taps per phase; the Recommendation's reference filter uses 12.
+taps per phase, and its zeroth phase is the identity, so the original sample grid is part of
+the candidate set and a true peak can never read below the sample peak. Loudness is accumulated
+in exact 100 ms slices regardless of how the audio is chunked into the meter.
+
+**A file's rate is read from its container, not from the decoder.** `decodeAudioData` resamples
+to the context's rate and the AudioBuffer then reports *that* — so asking the decoded buffer
+what rate the file was is asking the resampler what it resampled to. The header is parsed first,
+for WAV, FLAC, AIFF and Ogg, and the context is opened at the file's own rate. A container that
+does not state one is reported as unknown rather than as agreement.
 
 **Colour maps rise monotonically in lightness.** A spectrogram encodes a scalar in colour, and a
 map whose lightness is not monotonic invents features that are not in the signal — the classic
@@ -425,16 +466,28 @@ rainbow puts a bright band in the middle of a smooth ramp and you read it as a p
 Two independent layers, because a GPU FFT can be subtly wrong — a flipped sign in a butterfly, a
 twiddle indexed off by a stride — and still produce a plausible-looking spectrum.
 
-`npm test` runs 22 checks. Sixteen are numerical, against `dsp/`: the packed real FFT versus a
-naive DFT at every shipped size, Parseval, exact window sums, K-weighting against the
-coefficients tabulated in BS.1770-4, NSDF octave robustness on a harmonic stack, and
-reassignment placing an impulse on its exact sample and an off-bin sinusoid within 0.01 Hz.
+`npm test` runs 101 checks. Forty-seven are numerical, against `dsp/` and `gpu/particle.ts`: the
+packed real FFT versus a naive DFT at every shipped size, Parseval, exact window sums,
+K-weighting against the coefficients tabulated in BS.1770-4, NSDF octave robustness on a
+harmonic stack, reassignment placing an impulse on its exact sample and an off-bin sinusoid
+within 0.01 Hz, every tuning system's cent table, and the particle bit layout in both
+directions.
 
-The other six cover the keyboard map, which is the one part of the UI that fails silently — a
-duplicate token does not throw, it just makes the second binding unreachable in whichever mode
-shadows it. They enumerate every reachable mode and trigger combination and assert that no two
-bindings answer to the same keystroke, that tokens are canonical, and that driving every numeric
-binding two hundred steps into its rail leaves the config finite and its ranges non-inverted.
+Seven of those are the loudness meter, and they pin the two properties that are easiest to lose
+and hardest to notice: that the reading does not depend on how the caller chunks the stream —
+the same eight seconds fed in 1-, 128-, 777-, 4799-, 4801- and 8192-frame blocks must agree to
+a nanobel — and that true peak never reads below sample peak at any supported rate, while still
+finding an inter-sample crest the sample peak misses. Four more pin the windows: that no window
+has an impulse at the start of its derivative table, that a Kaiser at β=0 really is rectangular,
+and that a window which does not taper is refused for frequency reassignment rather than
+silently correcting by zero.
+
+The remaining checks cover the keyboard map, the dock and the MIDI binding layer. The keymap is
+the one part of the UI that fails silently — a duplicate token does not throw, it just makes the
+second binding unreachable in whichever mode shadows it. They enumerate every reachable mode and
+trigger combination and assert that no two bindings answer to the same keystroke, that tokens
+are canonical, and that driving every numeric binding two hundred steps into its rail leaves the
+config finite and its ranges non-inverted.
 
 The **System ▸ Run FFT self-test** button pushes a synthetic two-tone signal through the real
 GPU pipeline and compares the result against the f64 CPU reference. Measured on this machine:

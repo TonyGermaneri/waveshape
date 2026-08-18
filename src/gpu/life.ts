@@ -23,15 +23,9 @@ import { rasteriseWheel, wheelById } from './colormap.ts'
 import type { Analyzer } from './analyzer.ts'
 
 import lifeWgsl from './shaders/life.wgsl?raw'
+import { FIELD_BINS, FIELD_MIN_HZ, FIELD_OCTAVES, PARTICLE_CAPACITY } from './limits.ts'
 
-/** Bins across the field. About 100 to the octave — a shade over a tenth of a semitone. */
-export const FIELD_BINS = 1024
-/** The field spans ten octaves from here: 20 Hz to 20.48 kHz. */
-export const FIELD_MIN_HZ = 20
-export const FIELD_OCTAVES = 10
-
-/** 32 bytes each; 256k of them is 8 MB, and a busy frame births a few thousand. */
-export const PARTICLE_CAPACITY = 1 << 18
+export { FIELD_BINS, FIELD_MIN_HZ, FIELD_OCTAVES, PARTICLE_CAPACITY }
 
 /** Entries in the rasterised pitch-class wheel. A shade over twenty per semitone. */
 const WHEEL_ENTRIES = 256
@@ -39,10 +33,42 @@ const WHEEL_ENTRIES = 256
 const CENSUS_BYTES = 16 + 32 * 8
 /** Nine vec4s. Kept in step with `Params` in life.wgsl. */
 const PARAM_BYTES = 9 * 16
+/** Uniform slot stride; must be a multiple of minUniformBufferOffsetAlignment. */
+const PARAM_STRIDE = 256
+
+/**
+ * The organism's clock, in steps per second of *audio*.
+ *
+ * It used to be one step per rendered frame, which made every rate in the physics — drift,
+ * vibrato, the walk along its own series, starvation, the lifespan — a function of the monitor
+ * in front of it. The same signal grew a different organism at 60 Hz and at 120 Hz, and none at
+ * all in a background tab, where the browser throttles the frame callback to once a second.
+ *
+ * Sixty was chosen rather than derived. It is what the defaults here were tuned against, so a
+ * session on an ordinary 60 Hz display sees exactly what it saw before; every other display,
+ * hop size and sample rate now sees the same thing rather than its own variation. Deriving it
+ * from the analysis rate would have been the more obvious choice and is the wrong one: the hop
+ * is a resolution setting, and moving it should not change how fast anything lives.
+ */
+export const LIFE_STEPS_PER_SECOND = 60
+
+/**
+ * Steps one paint may run before the clock is allowed to fall behind.
+ *
+ * The organism catches up after a hitch, which is the whole point, but catching up is also work
+ * — and a frame that stalled once should not be handed the bill for the stall on top of its own
+ * paint. Past this the debt is written off rather than carried: a tab that was hidden for a
+ * minute resumes where the audio is, not where it would have been.
+ */
+const MAX_STEPS_PER_RECORD = 16
 
 export interface LifeFrame {
   config: Config
   pointCount: number
+  /** Ceiling on the population from the GPU budget; see gpu/budget.ts. */
+  maxPopulation: number
+  /** Samples of audio the analysis advanced by since the last paint. The organism's clock. */
+  elapsedSamples: number
   sampleRate: number
   /** Bins in the magnitude spectrum, i.e. fftSize / 2 + 1. */
   spectrumBins: number
@@ -76,6 +102,8 @@ export class Life {
   private binds: [GPUBindGroup, GPUBindGroup] | null = null
   private parity = 0
   private frame = 0
+  /** Audio time owed to the organism but not yet stepped, in seconds. */
+  private clockDebt = 0
 
   private readonly scratch = new ArrayBuffer(PARAM_BYTES)
   private readonly f32 = new Float32Array(this.scratch)
@@ -104,22 +132,31 @@ export class Life {
       size: WHEEL_ENTRIES * 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    // One slot per step this pass may run, selected by dynamic offset. The steps of a single
+    // paint have to differ from one another — the wander term and the vitality dither are both
+    // hashed from the step counter — and `queue.writeBuffer` is ordered ahead of the entire
+    // command buffer, so rewriting one slot between dispatches would give every dispatch the
+    // last value written. Slots are the only way to hand consecutive steps consecutive numbers.
     this.params = device.createBuffer({
       label: 'life-params',
-      size: PARAM_BYTES,
+      size: PARAM_STRIDE * MAX_STEPS_PER_RECORD,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
     const C = GPUShaderStage.COMPUTE
-    const entry = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
+    const entry = (
+      binding: number,
+      type: GPUBufferBindingType,
+      hasDynamicOffset = false,
+    ): GPUBindGroupLayoutEntry => ({
       binding,
       visibility: C,
-      buffer: { type },
+      buffer: { type, hasDynamicOffset },
     })
     this.layout = device.createBindGroupLayout({
       label: 'life',
       entries: [
-        entry(0, 'uniform'),
+        entry(0, 'uniform', true),
         entry(1, 'read-only-storage'),
         entry(2, 'storage'),
         entry(3, 'read-only-storage'),
@@ -172,16 +209,31 @@ export class Life {
     }
   }
 
-  /** Called when the source changes: the previous signal's organism has nothing to say here. */
+  /**
+   * Called when the source changes: the previous signal's organism has nothing to say here.
+   *
+   * The pool is cleared along with the field. It used to be left alone, on the reasoning that
+   * the birth ring would overwrite it within a second or two and eight megabytes of zeroes was
+   * not worth the bandwidth — but "within a second or two" assumed a new signal busy enough to
+   * fill the ring, and the case that matters most is the opposite one. Stop the capture, or
+   * open a quiet file, and nothing is born: the previous source's population goes on being
+   * stepped and drawn over material it never heard, which is the one thing an organism seeded
+   * by measurement must never do. A single 8 MB upload on a source change is not a cost.
+   */
   reset(): void {
     const zeros = new Uint32Array(FIELD_BINS)
     for (const field of this.fields) this.device.queue.writeBuffer(field, 0, zeros)
     this.device.queue.writeBuffer(this.deposit, 0, zeros)
     this.device.queue.writeBuffer(this.allocator, 0, new Uint32Array(4))
-    // Particles are not cleared: the alive flag lives in the top byte of the colour word, and
-    // writing 8 MB of zeroes to extinguish a population the ring will overwrite within a
-    // second or two is not worth the bandwidth. What matters is that no *live* particle points
-    // at the old signal's field, and zeroing the field achieves that.
+    this.clockDebt = 0
+    // The whole pool, not just the slots currently inside the population cap: raising the cap
+    // afterwards would otherwise walk straight back into the old cast.
+    this.device.queue.writeBuffer(
+      this.particles,
+      0,
+      new Uint32Array((PARTICLE_CAPACITY * PARTICLE_BYTES) / 4),
+    )
+    this.frame = 0
     this.binds = null
   }
 
@@ -191,7 +243,7 @@ export class Life {
       this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.params } },
+          { binding: 0, resource: { buffer: this.params, size: PARAM_BYTES } },
           { binding: 1, resource: { buffer: this.analyzer.pointsBuf } },
           { binding: 2, resource: { buffer: this.particles } },
           { binding: 3, resource: { buffer: read } },
@@ -214,16 +266,32 @@ export class Life {
    * Records one generation. Returns the number of particle slots the renderer should draw —
    * the whole pool, since deciding which slots are alive is the vertex stage's job and doing it
    * here would mean a readback.
+   *
+   * "One generation" is however many fixed steps the audio that arrived since the last paint
+   * pays for, which is normally one or two and is zero when nothing arrived. The census and the
+   * births happen once — the points are already a batch covering the whole interval — and then
+   * the population is stepped and the field settled once per tick of the organism's own clock.
    */
   record(encoder: GPUCommandEncoder, frame: LifeFrame): number {
     const life = frame.config.life
     const f = this.f32
     const u = this.u32
 
+    // Whole steps only; the remainder is carried so a display rate that does not divide the
+    // step rate evenly still averages out to the right speed rather than rounding down forever.
+    this.clockDebt += frame.elapsedSamples / Math.max(frame.sampleRate, 1)
+    let steps = Math.floor(this.clockDebt * LIFE_STEPS_PER_SECOND)
+    if (steps >= MAX_STEPS_PER_RECORD) {
+      steps = MAX_STEPS_PER_RECORD
+      this.clockDebt = 0
+    } else if (steps > 0) {
+      this.clockDebt -= steps / LIFE_STEPS_PER_SECOND
+    }
+
     u[0] = frame.pointCount
     u[1] = PARTICLE_CAPACITY
     u[2] = FIELD_BINS
-    u[3] = this.frame++
+    u[3] = 0
     f[4] = frame.sampleRate
     f[5] = FIELD_MIN_HZ
     f[6] = FIELD_OCTAVES
@@ -245,7 +313,8 @@ export class Life {
     f[22] = frame.viewLowHz
     f[23] = frame.viewHighHz
     f[24] = life.wrap ? 1 : 0
-    f[25] = Math.min(life.population, PARTICLE_CAPACITY)
+    const cap = Math.min(life.population, frame.maxPopulation, PARTICLE_CAPACITY)
+    f[25] = cap
     f[26] = life.crowding
     f[27] = life.settling
     f[28] = life.feed
@@ -257,7 +326,12 @@ export class Life {
     f[34] = life.surfacePull
     const wheel = wheelById(life.wheel)
     f[35] = wheel.turns ?? 1
-    this.device.queue.writeBuffer(this.params, 0, this.scratch, 0, PARAM_BYTES)
+    // One slot per step, differing only in the step counter. See the buffer's own note.
+    for (let i = 0; i < Math.max(1, steps); i++) {
+      u[3] = this.frame + i
+      this.device.queue.writeBuffer(this.params, i * PARAM_STRIDE, this.scratch, 0, PARAM_BYTES)
+    }
+    this.frame += Math.max(1, steps)
 
     // Rasterised on change rather than every frame. Two wheels can share stops and differ only
     // in how many turns they take — the circle of fifths is the even wheel walked sevenfold —
@@ -267,12 +341,15 @@ export class Life {
       this.wheelId = wheel.id
     }
 
-    const [a, b] = this.ensureBinds()
-    const bind = this.parity === 0 ? a : b
-    this.parity ^= 1
+    const binds = this.ensureBinds()
+    // Only the live part of the ring is stepped. With a cap of a few thousand there is no
+    // reason to walk a quarter of a million dead slots to find them.
+    const live = cap
+    const stepGroups = Math.ceil(live / 64)
+    const settleGroups = Math.ceil(FIELD_BINS / 64)
 
     const pass = encoder.beginComputePass({ label: 'life' })
-    pass.setBindGroup(0, bind)
+    pass.setBindGroup(0, binds[this.parity], [0])
 
     // One workgroup, deliberately: the survey ends in a serial merge on a single thread, and
     // splitting it across workgroups would need a second pass to merge the merges.
@@ -284,14 +361,18 @@ export class Life {
       pass.dispatchWorkgroups(Math.ceil(frame.pointCount / 64))
     }
 
-    // Only the live part of the ring is stepped. With a cap of a few thousand there is no
-    // reason to walk a quarter of a million dead slots to find them.
-    const live = Math.min(life.population, PARTICLE_CAPACITY)
-    pass.setPipeline(this.stepPipeline)
-    pass.dispatchWorkgroups(Math.ceil(live / 64))
-
-    pass.setPipeline(this.settlePipeline)
-    pass.dispatchWorkgroups(Math.ceil(FIELD_BINS / 64))
+    // Step and settle together, once per tick. The field decay and the three-tap blur in
+    // `settle` are per-step quantities exactly as the drift and the starvation are, so running
+    // the population twice against one settle would let the pheromone outlive its own clock.
+    // The parity flips with each pair because `settle` reads the field it is not writing.
+    for (let i = 0; i < steps; i++) {
+      pass.setBindGroup(0, binds[this.parity], [i * PARAM_STRIDE])
+      pass.setPipeline(this.stepPipeline)
+      pass.dispatchWorkgroups(stepGroups)
+      pass.setPipeline(this.settlePipeline)
+      pass.dispatchWorkgroups(settleGroups)
+      this.parity ^= 1
+    }
     pass.end()
 
     return live

@@ -19,7 +19,8 @@ struct Params {
   a: vec4<u32>,
   // x: hop (samples)   y: freqMin   z: freqMax   w: logAxis
   b: vec4<f32>,
-  // x: splatRadius px   y: gain   z: clear range 0 start   w: clear range 0 count
+  // x: splatRadius px   y: unused (gain belongs to the present pass)   z: clear range 0 start
+  // w: clear range 0 count
   c: vec4<f32>,
   // x: clear range 1 start   y: clear range 1 count   z: columns advanced this frame
   // w: life point size px
@@ -115,7 +116,7 @@ fn vsSplat(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -
 
   out.pos = vec4<f32>((px / cols) * 2.0 - 1.0, (py / rows) * 2.0 - 1.0, 0.0, 1.0);
   out.offset = c * r;
-  out.energy = p.z * p.z * P.c.y;
+  out.energy = p.z * p.z;
   return out;
 }
 
@@ -224,7 +225,7 @@ fn vsLife(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) ->
   // Vitality lives in bits 16..21 of life1, and is what makes a dying particle fade rather than
   // vanish between one frame and the next.
   let vitality = f32((q.life1 >> 16u) & 63u) / 63.0;
-  out.energy = q.energy * q.energy * vitality * P.c.y * P.e.x;
+  out.energy = q.energy * q.energy * vitality * P.e.x;
   return out;
 }
 

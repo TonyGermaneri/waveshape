@@ -150,9 +150,10 @@ export interface Config {
   }
   vector: {
     /**
-     * Radial gain. At 1 a full-scale correlated signal reaches the ±0.707 reference, which is
-     * where the rotation puts it. The graticule stays where it is when this moves, the way a
-     * scope's does: the figure grows past its own reference rather than taking it along.
+     * Radial gain. At 1 a full-scale signal reaches the outer ruling: mono at the top of the
+     * mid/side figure, out of phase at its side, either channel on its own axis in Lissajous.
+     * The graticule stays where it is when this moves, the way a scope's does: the figure grows
+     * past its own reference rather than taking it along.
      */
     gain: number
     mode: VectorMode
@@ -241,7 +242,13 @@ export interface Config {
     roam: number
     /** Depth in cents of the intrinsic oscillation, whose rate is the particle's harmonic number. */
     vibrato: number
-    /** Steps an unfed particle survives. How far it can travel before the journey kills it. */
+    /**
+     * Steps an unfed particle survives. How far it can travel before the journey kills it.
+     *
+     * A step is a fixed slice of *audio* — see LIFE_STEPS_PER_SECOND in gpu/life.ts — so every
+     * number here that is counted in steps is a duration, and means the same duration whatever
+     * the display is doing and whatever the hop is set to.
+     */
     stamina: number
     /**
      * Fraction of the pheromone field surviving each step. The field only — starvation has its

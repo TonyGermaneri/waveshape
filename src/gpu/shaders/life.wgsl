@@ -14,13 +14,19 @@
 // living. Point it at a chord and the particles migrate onto the ratios; point it at noise and
 // they find nothing to lock to and disperse.
 //
-// Four passes per frame:
+// Four passes per paint:
 //
 //   census   one workgroup surveys the spectrum: the loudest partials, the fundamental they
 //            imply, and how noise-like the whole frame is
 //   birth    one thread per reassigned point, turning it into a particle that knows what it is
 //   step     one thread per particle: sense at harmonic ratios, steer, move, age, deposit
 //   settle   the pheromone field decays and diffuses, and the atomic accumulator is drained
+//
+// The first two run once; the last two run once per tick of the organism's clock, which is a
+// fixed number of steps per second of *audio* rather than one per painted frame. Every rate
+// below — the drift, the wobble, the walk along its own series, the starvation, the field's
+// decay — is therefore per unit of audio time, and the same signal grows the same organism on a
+// 60 Hz display, a 144 Hz display and a throttled background tab. See gpu/life.ts.
 //
 // The bit layout of a particle is defined in gpu/particle.ts and duplicated here. The two must
 // agree; particle.test.ts pins the TypeScript side and this file's field offsets are written
@@ -42,7 +48,7 @@ struct Particle {
 }
 
 struct Params {
-  // x: pointCount   y: particleCapacity   z: fieldBins   w: frameCounter
+  // x: pointCount   y: particleCapacity   z: fieldBins   w: stepCounter
   a: vec4<u32>,
   // x: sampleRate   y: fieldMinHz   z: fieldOctaves   w: hop
   b: vec4<f32>,
@@ -97,7 +103,7 @@ struct Census {
 
 const FLAG_ALIVE: u32 = 1u;
 const FLAG_HARMONIC: u32 = 2u;
-const FLAG_ONSET: u32 = 4u;
+const FLAG_VACANT: u32 = 4u;
 const FLAG_NOISE: u32 = 8u;
 /** Currently standing somewhere the spectrum still has energy. Set every step, not at birth. */
 const FLAG_FED: u32 = 16u;
@@ -119,14 +125,14 @@ fn readField(word: u32, shift: u32, bits: u32) -> u32 {
 }
 
 //  life0: harmonic 0..4, detune 5..10, support 11..15, flatness 16..19,
-//         onset 20..23, register 24..27, coherence 28..31
-fn packLife0(harmonic: u32, detuneCents: f32, support: u32, flatness: f32, onset: f32, freq: f32, coherence: f32) -> u32 {
+//         vacancy 20..23, register 24..27, coherence 28..31
+fn packLife0(harmonic: u32, detuneCents: f32, support: u32, flatness: f32, vacancy: f32, freq: f32, coherence: f32) -> u32 {
   var w = 0u;
   w = packField(w, harmonic, 0u, 5u);
   w = packField(w, u32(clamp(round(detuneCents) + 32.0, 0.0, 63.0)), 5u, 6u);
   w = packField(w, support, 11u, 5u);
   w = packField(w, u32(clamp(flatness, 0.0, 1.0) * 15.0 + 0.5), 16u, 4u);
-  w = packField(w, u32(clamp(round(onset * 7.0) + 8.0, 0.0, 15.0)), 20u, 4u);
+  w = packField(w, u32(clamp(round(vacancy * 7.0) + 8.0, 0.0, 15.0)), 20u, 4u);
   w = packField(w, u32(clamp(floor(log2(max(freq, 20.0) / 20.0)), 0.0, 15.0)), 24u, 4u);
   w = packField(w, u32(clamp(coherence, 0.0, 1.0) * 15.0 + 0.5), 28u, 4u);
   return w;
@@ -353,6 +359,8 @@ fn intervalAffinity(i: u32) -> f32 {
 
 /** Radians per step for a fundamental. A harmonic n wobbles n times as fast. */
 const VIBRATO_RATE: f32 = 0.021;
+// A step is a fixed slice of audio, so this is a real frequency: 0.021 rad/step at 60 steps
+// per second is about a fifth of a hertz for a fundamental, and eight times that at the cap.
 /** Radians per step of the slow walk up and down the particle's own series. */
 const ROAM_RATE: f32 = 0.0165;
 
@@ -472,6 +480,11 @@ fn survey(@builtin(local_invocation_id) lid: vec3<u32>) {
 
   // Wiener entropy over the whole frame, as the exponential of a mean log rather than a
   // product that would underflow long before it finished.
+  //
+  // One number for the entire spectrum, from every thirty-seventh bin. It is a description of
+  // the frame, not of anywhere in it: two particles born an octave apart into a frame holding
+  // one clean tone and one band of hiss are handed the same flatness, and neither reading is
+  // about its own neighbourhood.
   var glog = 0.0;
   var asum = 0.0;
   var n = 0.0;
@@ -522,11 +535,22 @@ fn birth(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (k == 0u || k + 1u >= bins) { return; }
   if (!(spectrum[k] > spectrum[k - 1u] && spectrum[k] >= spectrum[k + 1u])) { return; }
 
+  // Every point in the batch is identified against *this* census, which was taken from the
+  // newest frame's spectrum. A batch spans however many analysis frames arrived between two
+  // paints, so a point measured at the start of a sweep is named by the fundamental at the end
+  // of it. The same applies to the local-maximum test above. At the default hop and rate a
+  // batch is a few frames and this is a small approximation; at high analysis rates it is not,
+  // and it is the reason a Life trail is not a measured partial trajectory.
   let fundamental = census.fundamental;
   let id = harmonicNumber(freq, fundamental);
+  // MAX_HARMONIC is 31, so nothing above the thirty-first partial is named at all: for an A1
+  // fundamental that is everything above about 1.7 kHz.
   let harmonic = u32(id.x);
 
-  // How much family it has: partials of the same series present in this frame.
+  // How much of the series is present in this frame — distinct harmonic numbers among the
+  // census peaks, this particle's own included. It is a property of the *series* and not of
+  // this particle: every particle born this frame from the same fundamental gets the same
+  // count, and a partial with no siblings at all still counts itself as one.
   var support = 0u;
   var seen = 0u;
   for (var i = 0u; i < census.peakCount; i = i + 1u) {
@@ -554,13 +578,17 @@ fn birth(@builtin(global_invocation_id) gid: vec3<u32>) {
   // stream of identical newborns becomes a cast of individuals that persist and travel.
   let crowd = occupancy(freq, amp);
   let generation = u32(clamp(crowd * 4.0, 0.0, 15.0));
-  let onset = clamp(1.0 - crowd, -1.0, 1.0);
+  // How empty this frequency was. Named for what it measures: it is the pheromone field's
+  // occupancy inverted, so it says how much company the newcomer has, and nothing whatever
+  // about whether the partial had just started sounding. It was called `onset`, which promised
+  // spectral flux and delivered crowding.
+  let vacancy = clamp(1.0 - crowd, -1.0, 1.0);
   if (crowd > P.h.y) { return; }
 
   let flatness = census.flatness;
   var flags = FLAG_ALIVE;
   if (harmonic > 0u) { flags = flags | FLAG_HARMONIC; }
-  if (onset > 0.4) { flags = flags | FLAG_ONSET; }
+  if (vacancy > 0.4) { flags = flags | FLAG_VACANT; }
   if (flatness > 0.5) { flags = flags | FLAG_NOISE; }
 
   let rgb = particleColour(freq, harmonic, f32(support), flatness);
@@ -583,7 +611,7 @@ fn birth(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (harmonic > 0u && fundamental > 0.0) {
     detune = 1200.0 * log2(freq / (f32(harmonic) * fundamental));
   }
-  q.life0 = packLife0(harmonic, detune, support, flatness, onset, freq, coherence);
+  q.life0 = packLife0(harmonic, detune, support, flatness, vacancy, freq, coherence);
   q.life1 = packLife1(0u, 1.0, census.cohort, generation, 0.5);
   q.birthFreq = freq;
   particles[slot] = q;
@@ -703,8 +731,9 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   // break the tie the crowding tension above would freeze at its own fixed point.
   let restless = 0.12 + (1.0 - coherence) * (0.35 + 0.65 * flatness);
   if (restless > 0.01) {
-    // Hashed from the slot and the frame counter: no RNG state to store, and two particles in
-    // the same slot on successive frames get unrelated numbers.
+    // Hashed from the slot and the step counter: no RNG state to store, and two particles in
+    // the same slot on successive steps get unrelated numbers — including two steps inside one
+    // paint, which is why the counter is handed over a slot per step rather than a slot a frame.
     var h = tid * 747796405u + P.a.w * 2891336453u;
     h = (h ^ (h >> 15u)) * 2246822519u;
     h = (h ^ (h >> 13u)) * 3266489917u;
@@ -716,7 +745,7 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   //
   // Age reaches the motion, not only the mortality. A particle that has just arrived has no
   // stake in where it is and casts about; one that has been holding a frequency for a long time
-  // has, by having survived there, earned the right to be left alone. Every onset therefore
+  // has, by having survived there, earned the right to be left alone. Every new arrival
   // throws up a burst of searching that settles, which is what an attack looks like.
   let settled = 1.0 / (1.0 + f32(age) * P.g.w);
   // Tenure quietens a particle, but hunger overrides it: an established resident whose partial

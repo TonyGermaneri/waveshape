@@ -19,8 +19,14 @@
  */
 
 import { AudioRing, COUNTER_MASK } from '../audio/ring.ts'
-import { buildWindowTables, type WindowId, type WindowTables } from '../dsp/windows.ts'
+import {
+  REASSIGN_ENDPOINT_LIMIT,
+  buildWindowTables,
+  type WindowId,
+  type WindowTables,
+} from '../dsp/windows.ts'
 import { fftReal } from '../dsp/fft.ts'
+import { COMPLEX_BUDGET, MAX_COLUMNS, MAX_FFT_SIZE, MAX_LAGS, POINT_BUDGET } from './limits.ts'
 
 import prepareWgsl from './shaders/prepare.wgsl?raw'
 import fftWgsl from './shaders/fft.wgsl?raw'
@@ -30,11 +36,9 @@ import envelopeWgsl from './shaders/envelope.wgsl?raw'
 import speccolsWgsl from './shaders/speccols.wgsl?raw'
 import nsdfWgsl from './shaders/nsdf.wgsl?raw'
 
-export const MAX_FFT_SIZE = 65536
-/** Ceiling on complex elements per FFT ping-pong buffer (2^21 -> 16 MB each). */
-const COMPLEX_BUDGET = 1 << 21
-const MAX_COLUMNS = 4096
-const MAX_LAGS = 8192
+// Re-exported so callers keep asking the analyser how big the analyser's buffers are.
+export { COMPLEX_BUDGET, MAX_COLUMNS, MAX_FFT_SIZE, MAX_LAGS, POINT_BUDGET }
+
 const WORKGROUP = 64
 const UNIFORM_STRIDE = 256
 
@@ -98,6 +102,11 @@ export interface FrameStats {
   binCount: number
   hopHz: number
   pointCount: number
+  /**
+   * Whether reassignment actually ran. False when it is switched off, and false when the
+   * chosen window has no usable derivative for it — see REASSIGN_ENDPOINT_LIMIT.
+   */
+  reassigned: boolean
 }
 
 export class Analyzer {
@@ -166,6 +175,8 @@ export class Analyzer {
   private gpuHead = 0
   private tables: WindowTables | null = null
   private tableKey = ''
+  /** Everything that changes what a stored spectrum bin *means*. */
+  private spectraKey = ''
   private twiddleSize = 0
   private droppedFrames = 0
   private lappedFrames = 0
@@ -192,7 +203,7 @@ export class Analyzer {
     this.spectrumBuf = mk('spectrum', 2 * (MAX_FFT_SIZE / 2 + 1) * 4)
     this.peaksBuf = mk('peaks', 2 * (MAX_FFT_SIZE / 2 + 1) * 4)
     this.averageBuf = mk('average', 2 * (MAX_FFT_SIZE / 2 + 1) * 4)
-    this.pointsBuf = mk('points', 8 * 1024 * 1024)
+    this.pointsBuf = mk('points', POINT_BUDGET * 16)
     this.specColsBuf = mk('spectrum-columns', MAX_COLUMNS * 2 * 16)
     this.envBuf = mk('envelope', MAX_COLUMNS * 2 * 16)
     this.timebaseBuf = mk('timebase', 16)
@@ -207,10 +218,7 @@ export class Analyzer {
     this.specColsUniform = mk('u-speccols', 48, uniform)
     this.nsdfUniform = mk('u-nsdf', 80, uniform)
 
-    // Peak-hold starts at the floor rather than at zero, otherwise the first frames show a
-    // full-scale peak line while the decay walks it back down.
-    const initialPeaks = new Float32Array(2 * (MAX_FFT_SIZE / 2 + 1)).fill(-200)
-    device.queue.writeBuffer(this.peaksBuf, 0, initialPeaks)
+    this.resetSpectra()
     device.queue.writeBuffer(this.timebaseBuf, 0, new Float32Array([1024, 1024, 0, 0]))
 
     // --- layouts ---
@@ -355,6 +363,8 @@ export class Analyzer {
     this.nsdfBind = null
     this.analysisCursor = -1
     this.droppedFrames = 0
+    // Nothing the previous source deposited in the integrators describes this one.
+    this.resetSpectra()
     if (!ring) return
 
     this.audioBuf = this.device.createBuffer({
@@ -429,7 +439,7 @@ export class Analyzer {
     this.analyzeBind = dev.createBindGroup({
       layout: this.analyzeLayout,
       entries: [
-        { binding: 0, resource: { buffer: this.analyzeUniform, size: 64 } },
+        { binding: 0, resource: { buffer: this.analyzeUniform, size: 80 } },
         { binding: 1, resource: { buffer: this.binsBuf } },
         { binding: 2, resource: { buffer: this.spectrumBuf } },
         { binding: 3, resource: { buffer: this.peaksBuf } },
@@ -450,6 +460,26 @@ export class Analyzer {
   }
 
   /** Rebuild the window and twiddle tables when the transform configuration changes. */
+  /**
+   * Clear the integrators that carry state from one frame to the next.
+   *
+   * Peak hold and the Welch average are indexed by `channel * (fftSize/2 + 1) + bin`, so a
+   * change of FFT size does not merely leave them stale — it re-points every stored value at a
+   * different frequency. A change of scale re-points them at a different *unit*, amplitude and
+   * spectral density being orders of magnitude apart. Neither is something a decay can walk
+   * out of: the old contents have to go, or two sources' measurements are read as one.
+   *
+   * Peak hold starts at the floor rather than at zero, otherwise the first frames show a
+   * full-scale peak line while the decay walks it back down.
+   */
+  resetSpectra(): void {
+    const count = 2 * (MAX_FFT_SIZE / 2 + 1)
+    const floored = new Float32Array(count).fill(-200)
+    this.device.queue.writeBuffer(this.spectrumBuf, 0, floored)
+    this.device.queue.writeBuffer(this.peaksBuf, 0, floored)
+    this.device.queue.writeBuffer(this.averageBuf, 0, new Float32Array(count))
+  }
+
   private ensureTables(s: AnalyzerSettings): WindowTables {
     const key = `${s.fftSize}|${s.window}|${s.windowParam}`
     if (this.tables && this.tableKey === key) return this.tables
@@ -535,6 +565,7 @@ export class Analyzer {
       binCount: settings.fftSize / 2 + 1,
       hopHz: this.sampleRate / Math.max(1, settings.hop),
       pointCount: 0,
+      reassigned: false,
     }
     if (!ring || !this.audioBuf) return stats
 
@@ -543,7 +574,13 @@ export class Analyzer {
     const l = n >> 1
     const hop = Math.max(1, settings.hop)
     const channels = Math.max(1, Math.min(2, settings.channelCount))
-    const variants = settings.reassign ? 3 : 1
+    // A window that does not taper has no derivative for the frequency correction to read, and
+    // running the two extra transforms to compute a correction that is identically zero is
+    // worse than not running them: it looks like reassignment is on. Refuse instead, and say so
+    // through the statistics so the readout can too.
+    const reassign = settings.reassign && tables.endpointRatio <= REASSIGN_ENDPOINT_LIMIT
+    const variants = reassign ? 3 : 1
+    stats.reassigned = reassign
 
     // How many complete analysis windows are waiting?
     if (this.analysisCursor < 0) this.analysisCursor = (head - n) & COUNTER_MASK
@@ -555,10 +592,13 @@ export class Analyzer {
     }
     let pending = span >= n ? Math.floor((span - n) / hop) + 1 : 0
 
-    // Cap the batch by both the buffer budget and the configured per-frame limit.
+    // Cap the batch by every budget it has to fit inside, not just the transform's: the point
+    // cloud is written by the same dispatch and overflowing it loses measurements silently.
+    // Frames shed here go through the drop counter, so the statistics say what happened.
     const perFrame = l * variants * channels
     const budgetFrames = Math.max(1, Math.floor(COMPLEX_BUDGET / perFrame))
-    const limit = Math.max(1, Math.min(maxFramesPerRender, budgetFrames))
+    const pointFrames = Math.max(1, Math.floor(POINT_BUDGET / (l + 1)))
+    const limit = Math.max(1, Math.min(maxFramesPerRender, budgetFrames, pointFrames))
     if (pending > limit) {
       const skip = pending - limit
       this.analysisCursor = (this.analysisCursor + skip * hop) & COUNTER_MASK
@@ -592,10 +632,16 @@ export class Analyzer {
         ? Math.sqrt(2 / (this.sampleRate * tables.s2))
         : tables.amplitudeScale
 
+    const spectraKey = `${n}|${settings.window}|${settings.windowParam}|${settings.scale}|${channels}`
+    if (this.spectraKey !== spectraKey) {
+      this.spectraKey = spectraKey
+      this.resetSpectra()
+    }
+
     this.recordPrepare(encoder, settings, startFrame, pending, channels, variants)
     const finalBuffer = this.recordFft(encoder, l, n, batch)
     this.recordUnpack(encoder, l, n, batch, finalBuffer)
-    this.recordAnalyze(encoder, settings, pending, channels, variants, ampScale, hop)
+    this.recordAnalyze(encoder, settings, pending, channels, variants, ampScale, hop, reassign)
     if (axis.columns > 0) this.recordSpectrumColumns(encoder, settings, axis, channels)
 
     stats.pointCount = pending * (l + 1)
@@ -737,6 +783,7 @@ export class Analyzer {
     variants: number,
     ampScale: number,
     hop: number,
+    reassign: boolean,
   ): void {
     const l = s.fftSize >> 1
     const binStride = l + 1
@@ -745,9 +792,10 @@ export class Analyzer {
     const displayChannel = Math.min(s.displayChannel, channels - 1)
 
     // Peak hold falls at a fixed rate per second; convert to per analysis frame so the visual
-    // decay rate is independent of hop size and sample rate.
+    // decay rate is independent of hop size, sample rate *and* display rate. The shader applies
+    // it once per frame inside its loop, so this must not be multiplied up by the batch length.
     const framesPerSecond = this.sampleRate / hop
-    const decayPerBatch = (s.peakDecayDbPerSecond / framesPerSecond) * frames
+    const decayPerFrame = s.peakDecayDbPerSecond / framesPerSecond
 
     // The averaging coefficient is given per second of audio for the same reason.
     const alpha =
@@ -761,20 +809,27 @@ export class Analyzer {
     u[2] = frames
     u[3] = variants
     u[4] = displayChannel
-    u[5] = s.reassign && variants >= 3 ? 1 : 0
+    u[5] = reassign && variants >= 3 ? 1 : 0
     u[6] = spectraThreads
     u[7] = s.fftSize
     f[8] = ampScale
-    f[9] = decayPerBatch
+    f[9] = decayPerFrame
     f[10] = alpha
     f[11] = s.floorDb
     f[12] = this.sampleRate
     f[13] = hop
     f[14] = s.maxTimeShift * s.fftSize
     f[15] = s.maxFreqShiftBins * binHz
-    this.device.queue.writeBuffer(this.analyzeUniform, 0, this.scratch, 0, 64)
+    // Half in amplitude, 1/sqrt(2) in density — see the note over `amplitudeAt`. Getting this
+    // from the scale rather than hardcoding it is the difference between a correct DC reading
+    // and one 3.01 dB low.
+    f[16] = s.scale === 'density' ? Math.SQRT1_2 : 0.5
+    f[17] = 0
+    f[18] = 0
+    f[19] = 0
+    this.device.queue.writeBuffer(this.analyzeUniform, 0, this.scratch, 0, 80)
     u[6] = pointThreads
-    this.device.queue.writeBuffer(this.analyzeUniform, UNIFORM_STRIDE, this.scratch, 0, 64)
+    this.device.queue.writeBuffer(this.analyzeUniform, UNIFORM_STRIDE, this.scratch, 0, 80)
 
     const pass = encoder.beginComputePass({ label: 'analyze' })
     pass.setPipeline(this.spectraPipeline)

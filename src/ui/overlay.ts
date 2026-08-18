@@ -45,6 +45,9 @@ import {
   type Size,
 } from './dock.ts'
 import { dismissHints, fmt, renderControls, type Control, type SwatchOption } from './widgets.ts'
+import { windowSupportsReassignment } from '../dsp/windows.ts'
+import { LIFE_STEPS_PER_SECOND } from '../gpu/life.ts'
+import { formatBytes, type BudgetReport } from '../gpu/budget.ts'
 import { MidiInput, ALL_INPUTS, signalLabel } from './midi.ts'
 import { MidiBindings, describeId } from './midi-bindings.ts'
 import { fullscreenSupported, isFullscreen, onFullscreenChange, toggleFullscreen } from './fullscreen.ts'
@@ -182,6 +185,10 @@ export interface OverlayStatus {
   binHz: number
   enbwHz: number
   latencyMs: number
+  /** What the GPU is being asked to hold, itemised. See gpu/budget.ts. */
+  budget: BudgetReport
+  /** Settings the budget had to reduce to fit, if any. */
+  budgetReduced: readonly string[]
 }
 
 export interface OverlayDeps {
@@ -986,6 +993,12 @@ export class Overlay {
     return `${noteName(midi)} ${cents >= 0 ? '+' : '−'}${Math.abs(cents).toFixed(0)}¢`
   }
 
+  /** Reassignment requested, but the window cannot support it. See dsp/windows.ts. */
+  private reassignmentRefused(): boolean {
+    const a = this.deps.config.analysis
+    return a.reassign && !windowSupportsReassignment(a.window, a.fftSize, a.windowParam)
+  }
+
   private readoutItems(s: OverlayStatus): HTMLElement[] {
     /** [key, value, characters the value is given]. */
     const items: [string, string, number][] = []
@@ -997,6 +1010,9 @@ export class Overlay {
     items.push(['Δf', `${s.binHz.toFixed(2)} Hz`, 10])
     items.push(['enbw', `${s.enbwHz.toFixed(2)} Hz`, 10])
     items.push(['rate/s', `${s.analysisFps.toFixed(0)}`, 4])
+    // Only when the answer is surprising: reassignment is switched on and is not running,
+    // because the chosen window has no derivative for it to read.
+    if (this.reassignmentRefused()) items.push(['reassign', 'off — window', 14])
     // The pitch estimate only drives the oscilloscope's trigger, so it is only worth the space
     // in the readout while that pane is open.
     if (this.deps.config.panes.wave) {
@@ -1316,7 +1332,7 @@ export class Overlay {
         label: 'Choose file…',
         action: 'pick-file',
         onClick: () => this.deps.onPickFile(),
-        hint: 'Decoded audio plays looped at the current AudioContext rate.',
+        hint: 'Plays looped. The container’s header is read before the audio context is opened, so a WAV, FLAC, AIFF or Ogg file is decoded at its own rate with nothing resampled behind it. Formats that do not state their rate — MP3, AAC, M4A — are decoded at whatever rate the context is running at, and System ▸ Resampling will say so rather than claim a match it could not check.',
       })
     }
 
@@ -1567,6 +1583,15 @@ export class Overlay {
         },
         hint: 'Relocates each bin to the centre of gravity of the energy it represents, computed from the phase derivative. Sharpens the spectrogram far beyond the window’s nominal resolution. Costs two extra transforms per frame.',
       },
+      ...(this.reassignmentRefused()
+        ? [
+            {
+              kind: 'note' as const,
+              tone: 'warn' as const,
+              text: 'Not running: the frequency correction is read from the window’s derivative, and this window does not taper to zero, so it has no usable one. A rectangular window’s derivative is identically zero — reassignment would silently do nothing rather than fail. Choose Hann, Blackman-Harris or any window that closes at both ends.',
+            },
+          ]
+        : []),
       {
         kind: 'slider',
         label: 'Max time correction',
@@ -2239,6 +2264,11 @@ export class Overlay {
         kind: 'note',
         text: 'The reassignment pass measures where energy is. This turns each of those measurements into an organism that knows what it is harmonically, and then lets it live: it senses at small integer ratios of its own frequency, migrates toward exact ratio with whatever it finds, and dies at a rate set by how tonal it was at birth.',
       },
+      {
+        kind: 'note',
+        tone: 'warn',
+        text: 'A trail here is not a measured partial trajectory. A particle is seeded by a measurement and then moves under forces — the crowd, the intervals, its own itinerary — so where it is now is its own doing and not a reading. Its harmonic number, siblings and flatness were all fixed at birth from the newest frame of that paint’s batch, and only the first thirty-one harmonics are named at all. For measurement, read the spectrogram and the spectrum: those are the instrument. This is what grows on it.',
+      },
       { kind: 'heading', text: 'Population' },
       {
         kind: 'toggle',
@@ -2264,7 +2294,7 @@ export class Overlay {
         disabled: () => !l.enabled,
         hint: 'How many may be alive at once. Slots are handed out in birth order, so when the cap is reached the ring comes back round to the oldest particle and takes it — culling by age costs nothing because it is what a ring already does.',
       },
-      num('Lifespan', 'lifespan', 0, 20000, 10, (v) => (v <= 0 ? 'until spent or off screen' : `${v.toFixed(0)} steps`), 'Zero is no clock at all: a particle then lives until its energy runs out, until it wanders off the top or bottom of the display, or until the population cap claims it.'),
+      num('Lifespan', 'lifespan', 0, 20000, 10, (v) => (v <= 0 ? 'until spent or off screen' : `${(v / LIFE_STEPS_PER_SECOND).toFixed(1)} s`), 'Zero is no clock at all: a particle then lives until its energy runs out, until it wanders off the top or bottom of the display, or until the population cap claims it. The organism runs on a fixed clock of its own, counted in audio rather than in painted frames, so a lifespan is a duration and not a frame count.'),
       {
         kind: 'toggle',
         label: 'Wrap the frequency axis',
@@ -2278,7 +2308,7 @@ export class Overlay {
       num('Birth threshold', 'birthThreshold', 0.00001, 0.02, 0.00001, (v) => `${(20 * Math.log10(v)).toFixed(0)} dB`, 'Quieter points are measured but not animated. Raising this is the difference between a population and a fog.', 'log'),
       num('Noise mortality', 'noiseMortality', 0, 6, 0.1, fmt.fixed(2), 'How much faster a particle born into a flat spectrum dies than one born on a peak.'),
       num('Family bonus', 'supportBonus', 0, 1, 0.01, fmt.fixed(2), 'How much longer a partial lives for each sibling on its harmonic series. A note persists; a click does not.'),
-      num('Stamina', 'stamina', 5, 6000, 5, (v) => `${v.toFixed(0)} steps unfed`, 'How long a particle survives away from any energy — which is to say how far it can travel before the journey kills it. This used to be the trail decay’s job as well, so endurance and memory could not be set apart; they are two knobs now because they were always two things.', 'log'),
+      num('Stamina', 'stamina', 5, 6000, 5, (v) => `${(v / LIFE_STEPS_PER_SECOND).toFixed(1)} s unfed`, 'How long a particle survives away from any energy — which is to say how far it can travel before the journey kills it. This used to be the trail decay’s job as well, so endurance and memory could not be set apart; they are two knobs now because they were always two things.', 'log'),
       { kind: 'heading', text: 'What moves it' },
       {
         kind: 'note',
@@ -2292,7 +2322,7 @@ export class Overlay {
       num('Vibrato', 'vibrato', 0, 400, 1, (v) => (v <= 0 ? 'none' : `${v.toFixed(0)} cents`), 'Depth of the intrinsic wobble every particle carries. Its rate is the harmonic number the particle was born as, capped at the eighth, so the partials of one note shimmer at integer multiples of one rate and stay recognisably one note while they move. Its depth is scaled by how unsure the particle is that it is a note at all: clean partials hold taut lines, noise-born ones shiver.'),
       num('Feeding', 'feed', 0.01, 1, 0.01, fmt.fixed(2), 'How fast a particle standing where the spectrum still has energy recovers. A particle grazes: stay on your partial and you are sustained, drift into a gap or outlive the note and you starve.'),
       num('Occupancy before renewal', 'occupancy', 0.5, 64, 0.5, (v) => `${v.toFixed(1)} particles`, 'How many may already live at a frequency before new energy renews them instead of spawning more. This is what stops the population being a fountain of identical newborns overwritten on the spot — lower it for a sparse cast of long-lived individuals, raise it for a crowd.'),
-      num('Settling', 'settling', 0, 0.2, 0.002, (v) => (v <= 0 ? 'never settles' : `half still by ${(1 / v).toFixed(0)} steps`), 'How quickly a particle stops *reacting* as it ages. Its own itinerary is exempt: an old organism is not a still one, it is one that has stopped being startled.'),
+      num('Settling', 'settling', 0, 0.2, 0.002, (v) => (v <= 0 ? 'never settles' : `half still by ${(1 / v / LIFE_STEPS_PER_SECOND).toFixed(1)} s`), 'How quickly a particle stops *reacting* as it ages. Its own itinerary is exempt: an old organism is not a still one, it is one that has stopped being startled.'),
       num('Sensor spread', 'sensorCents', 1, 1200, 1, (v) => `${v.toFixed(0)} cents`, 'How far above and below itself a particle listens for a ridge to follow — vibrato, a bent string, a siren.', 'log'),
       num('Turn rate', 'turnCents', -60, 60, 0.5, (v) => `${v.toFixed(1)} cents`, 'The unit every reactive force is measured in. Negative reverses all three at once, which is a different animal rather than a broken one.'),
       num('Drift limit', 'driftLimitCents', 1, 600, 1, (v) => `${v.toFixed(0)} cents/step`, 'The fastest a particle may migrate. At sixty frames a second, a hundred cents per step is an octave and a half every second.', 'log'),
@@ -2369,7 +2399,7 @@ export class Overlay {
       num('Trail modulation', 'trailModulation', 0, 3, 0.05, fmt.fixed(2), 'How much the particle’s life bends its own phosphor. The rate half is the wobble drawn into the trail, which runs at the harmonic number it was born as; the amplitude half is that a particle with vitality to spare leaves a long trail and a starving one barely marks the screen. At zero every trail is a plain fading streak.'),
       {
         kind: 'note',
-        text: 'Every particle carries 58 bits of life beside its 24 bits of colour: which harmonic it is, how many cents sharp, how many siblings it has, how flat its neighbourhood was, whether it was born on a rising edge, its octave, how far reassignment had to move it, its age, its vitality, its cohort, and how many times new energy has renewed it.',
+        text: 'Every particle carries 58 bits of life beside its 24 bits of colour: which of the first thirty-one harmonics it is, how many cents sharp, how many members its series had in that frame, how flat the whole frame was, how crowded the frequency it was born on already was, its octave, how far reassignment had to move it, its age, its vitality, its cohort, and how many times new energy has renewed it. Two of those are frame-wide rather than local — the flatness is one number for the whole spectrum, sampled every thirty-seventh bin, and the sibling count is of the series, not of this particle’s neighbourhood — and the crowding is field occupancy, not spectral flux.',
       },
     ]
   }
@@ -3370,11 +3400,53 @@ export class Overlay {
       {
         kind: 'readout',
         label: 'Resampling',
-        get: () =>
-          engine().bitPerfectRate
-            ? 'none — context matches device'
-            : engine().message || 'active',
+        get: () => {
+          const e = engine()
+          if (e.bitPerfectRate) return 'none — context matches the source'
+          if (!e.sourceRateKnown) return 'unknown — the container does not state its rate'
+          return e.message || 'active'
+        },
+        warn: () => !engine().bitPerfectRate,
       },
+      { kind: 'heading', text: 'GPU budget' },
+      ...this.live.budget.lines.map(
+        (line): Control => ({
+          kind: 'readout',
+          label: line.label,
+          get: () => {
+            const found = this.live.budget.lines.find((l) => l.label === line.label)
+            return formatBytes(found ? found.bytes : 0)
+          },
+        }),
+      ),
+      {
+        kind: 'readout',
+        label: 'Total held',
+        get: () => {
+          const b = this.live.budget
+          return `${formatBytes(b.total)} of ${formatBytes(b.ceiling)}`
+        },
+        meter: () => this.live.budget.total / Math.max(1, this.live.budget.ceiling),
+        warn: () => this.live.budget.total > this.live.budget.ceiling * 0.9,
+      },
+      {
+        kind: 'readout',
+        label: 'Population instances',
+        get: () => {
+          const n = this.live.budget.lifeInstances
+          return n <= 0 ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M / frame` : `${n} / frame`
+        },
+        warn: () => this.live.budget.lifeInstances > 4_000_000,
+      },
+      ...(this.live.budgetReduced.length
+        ? [
+            {
+              kind: 'note' as const,
+              tone: 'warn' as const,
+              text: `Over budget for this device. Reduced to fit: ${this.live.budgetReduced.join('; ')}. The two settings above that cannot be changed between frames — render scale and MSAA — are the ones to turn down if this persists.`,
+            },
+          ]
+        : []),
       {
         kind: 'readout',
         label: 'Input latency',

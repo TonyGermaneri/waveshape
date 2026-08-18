@@ -238,9 +238,16 @@ export function buildGraticule(
     return { lines, ticks }
   }
 
-  // Vectorscope: centre cross plus a reference at the amplitude the figure is read against —
-  // ±0.707 rotated, which is where a full-scale correlated signal reaches on the mid/side axes,
-  // and ±0.5 unrotated, where the same signal is simply half way out on each channel.
+  // Vectorscope: centre cross, an outer ruling at ±1 and an inner one at ±0.5. Both modes use
+  // the same two, because both are scaled so that the same signals land on them:
+  //
+  //   ±1     a full-scale signal — mono at the top of the mid/side figure, out of phase at its
+  //          side, and either channel on its own axis in Lissajous
+  //   ±0.5   one channel at full scale, which in mid/side puts the figure on the diagonal
+  //
+  // The mid/side rotation used to divide by sqrt(2) rather than by 2, which sent a full-scale
+  // mono signal to 1.414 — past the outer ruling and off the pane — while this comment claimed
+  // it landed on ±0.707. The graticule and the shader now agree; see gpu/shaders/draw_vector.wgsl.
   //
   // The figure is scaled by the pane's *shorter* side so that a circle stays a circle, so on a
   // pane that is not square the reference is not a fixed fraction of the width. Squaring the
@@ -249,7 +256,7 @@ export function buildGraticule(
   const squeeze = aspect > 1 ? 1 / aspect : 1
   const stretch = aspect < 1 ? aspect : 1
   const lissajous = config.vector.mode === 'lissajous'
-  for (const v of [-1, lissajous ? -0.5 : -Math.SQRT1_2, 0, lissajous ? 0.5 : Math.SQRT1_2, 1]) {
+  for (const v of [-1, -0.5, 0, 0.5, 1]) {
     const major = v === 0
     push(0.5 + (v * squeeze) / 2, false, major)
     push(0.5 - (v * stretch) / 2, true, major)
